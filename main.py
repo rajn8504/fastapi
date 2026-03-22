@@ -1014,5 +1014,3 @@ def place_order(client, lots: int, token_id: str) -> dict:
         k_cap=daily_key("capital_used"); r.incrbyfloat(k_cap,premium*qty); r.expire(k_cap,86400)
         daily_incr("trade_count")
         AuditLog.trade(order_id,tok.get("signal",""),qty,premium,sl_price,"PLACED")
-
-...
