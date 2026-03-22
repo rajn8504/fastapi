@@ -1018,7 +1018,7 @@ def place_order(client, lots: int, token_id: str) -> dict:
           import uvicorn
           import os
           port = 
-        int(os.environ.get("PORT", 8080))
+          int(os.environ.get("PORT", 8080))
           uvicorn.run(app, 
         host="0.0.0.0", port=port)
       
