@@ -58,21 +58,6 @@ def now_str():
 # =============================================================
 #  PLACEHOLDERS (PART-2 & PART-3 WILL REPLACE THESE)
 # =============================================================
-
-def analyze_market_basic():
-    """
-    PART 2 will fill real analysis:
-    - VWAP
-    - RSI
-    - ADX
-    - VIX
-    - Volume Trend
-    - Breadth
-    """
-    # TEMPORARY PLACEHOLDER (replaced in PART-2)
-    return False, "⚠️ TEMP: Market engine not added yet."
-
-
 def analyze_deep():
     """
     PART 3 will fill deep BUY/SELL logic:
@@ -222,3 +207,150 @@ def start_bot():
             print("⚠️ BOT ERROR, Restarting:", e)
             time.sleep(2)
             continue
+import requests
+import math
+import statistics
+import time
+from datetime import datetime
+import pytz
+
+# --------------------------------------------
+#  REAL MARKET ANALYSIS ENGINE
+# --------------------------------------------
+
+TV_HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def fetch_tv_candles():
+    """Fetch NIFTY 5-min candles from TradingView Free API"""
+    try:
+        url = "https://scanner.tradingview.com/india/scan"
+        payload = {
+            "symbols": {"tickers": ["NSE:NIFTY"], "query": {"types": []}},
+            "columns": [
+                "close", "open", "high", "low",
+                "volume", "RSI", "ADX", "VWAP"
+            ]
+        }
+        res = requests.post(url, json=payload, headers=TV_HEADERS, timeout=3)
+        data = res.json()["data"][0]["d"]
+
+        return {
+            "close": float(data[0]),
+            "open": float(data[1]),
+            "high": float(data[2]),
+            "low": float(data[3]),
+            "volume": float(data[4]),
+            "rsi": float(data[5]),
+            "adx": float(data[6]),
+            "vwap": float(data[7]),
+        }
+
+    except Exception as e:
+        return None
+
+
+def fetch_vix():
+    """Fetch India VIX from NSE (free API)"""
+    try:
+        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+        res = requests.get(url, headers=NSE_HEADERS, timeout=3)
+        json_data = res.json()
+        vix = json_data["records"]["data"][0]["PE"]["impliedVolatility"]
+        return float(vix) if vix else None
+    except:
+        return None
+
+
+def analyze_market_basic():
+    """
+    Market scoring:
+    -------------------
+    + Trend → 1 point
+    + VWAP distance → 1 point
+    + RSI 40–60 → 1 point
+    + ADX > 18 → 1 point
+    + Volume expansion → 1 point
+    + VIX < 18 → 1 point
+
+    Score >= 4 → GOOD MARKET
+    Score < 4  → BAD MARKET
+    """
+
+    data = fetch_tv_candles()
+    if data is None:
+        return False, "⚠️ Live market data unavailable (TV error). Avoid entry."
+
+    # Extract values
+    close = data["close"]
+    openp = data["open"]
+    vwap = data["vwap"]
+    rsi = data["rsi"]
+    adx = data["adx"]
+    volume = data["volume"]
+
+    score = 0
+    reasons = []
+
+    # 1) Trend check
+    if close > openp:
+        score += 1
+        reasons.append("Trend: Bullish")
+    elif close < openp:
+        score += 1
+        reasons.append("Trend: Bearish")
+    else:
+        reasons.append("Trend unclear")
+
+    # 2) VWAP distance
+    dist = abs(close - vwap) / vwap * 100
+    if dist < 0.25:
+        score += 1
+        reasons.append(f"VWAP: Close ({dist:.2f}%)")
+    else:
+        reasons.append(f"VWAP Far ({dist:.2f}%)")
+
+    # 3) RSI
+    if 40 <= rsi <= 60:
+        score += 1
+        reasons.append(f"RSI: Neutral ({rsi})")
+    else:
+        reasons.append(f"RSI Weak ({rsi})")
+
+    # 4) ADX
+    if adx > 18:
+        score += 1
+        reasons.append(f"ADX Strong ({adx})")
+    else:
+        reasons.append(f"ADX Weak ({adx})")
+
+    # 5) Volume expansion (simple threshold)
+    if volume > 100000:
+        score += 1
+        reasons.append("Volume: Good")
+    else:
+        reasons.append("Volume Weak")
+
+    # 6) VIX check (lower = safer)
+    vix = fetch_vix()
+    if vix and vix < 18:
+        score += 1
+        reasons.append(f"VIX OK ({vix})")
+    else:
+        reasons.append(f"VIX High ({vix})")
+
+    # FINAL DECISION
+    summary = " • ".join(reasons)
+
+    if score >= 4:
+        return True, f"📊 GOOD Market ({score}/6)\n{summary}"
+
+    return False, f"⚠️ BAD / Risky Market ({score}/6)\n{summary}"
