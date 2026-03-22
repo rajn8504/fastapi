@@ -194,8 +194,8 @@ def start_bot():
             bot.infinity_polling(long_polling_timeout=30, timeout=20)
         except Exception as e:
             print("⚠️ BOT ERROR, Restarting:", e)
-            time.sleep(2)
-                continue
+             time.sleep(2)
+      continue
 import requests
 import math
 import statistics
