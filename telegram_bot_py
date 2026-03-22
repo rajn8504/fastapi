@@ -186,17 +186,28 @@ def handle_message(msg):
 # =============================================================
 #  START BOT (CALLED FROM main.py)
 # =============================================================
-
 def start_bot():
-    print("🚀 Telegram Bot Started (Thread Mode)")
+    """
+    Self-Healing Infinite Loop:
+    - If Telegram polling fails → Restart automatically
+    - If network breaks → Retry
+    - If JSON parse error → Continue safely
+    - If unknown crash → Cooldown + Restart
+    """
+    print("🚀 Telegram Bot Started (Self-Healing Mode Enabled)")
+
     while True:
         try:
-            bot.infinity_polling(long_polling_timeout=30, timeout=20)
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=30,
+                allowed_updates=telebot.util.update_types
+            )
+
         except Exception as e:
-        print(…)
-        time.sleep(…)
-        continue
-    continue
+            print(f"⚠️ BOT ERROR → Auto-Recovering in 2 seconds...\n{e}")
+            time.sleep(2)
+            continue
 import requests
 import math
 import statistics
