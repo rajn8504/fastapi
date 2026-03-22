@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║   NIFTY Options Algo Trading System — Complete Production Build  ║
-║   Version: v5 + API Resilience Layer                             ║
+║   Version: v5 + API Resilience Layer + FastAPI Integration       ║
 ╠══════════════════════════════════════════════════════════════════╣
-║   FastAPI Integration Added - All 18 Safety Gates Intact         ║
+║   PRODUCTION SWAP ENABLED: Real Redis & Real SmartConnect        ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -12,6 +12,7 @@ from datetime import timezone
 from typing import Optional, Tuple, List, Dict, Any
 from fastapi import FastAPI, Request
 import uvicorn
+import pytz
 
 app = FastAPI()
 
@@ -34,8 +35,7 @@ SIGNAL_SCORE_MIN = 5
 MAX_LTP_AGE_MS  = 3000      # stale if fetch took > 3 sec
 RETRY_DELAY     = 0.8       # seconds between retries
 MAX_RETRIES     = 3
-ORDER_STATUS_VALID    = {"complete","open","trigger pending",
-                         "after market order req received","modified"}
+ORDER_STATUS_VALID    = {"complete","open","trigger pending", "after market order req received","modified"}
 ORDER_STATUS_TERMINAL = {"rejected","cancelled"}
 
 # Session times (IST, HHMM)
@@ -47,22 +47,15 @@ MARKET_OPEN     = 915
 MARKET_CLOSE    = 1530
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 1 — IST TIMEZONE (server-agnostic, works on UTC VPS)
+# SECTION 1 — IST TIMEZONE
 # ══════════════════════════════════════════════════════════════════
-try:
-    import pytz
-    _IST = pytz.timezone("Asia/Kolkata")
-    def _now_ist() -> datetime.datetime:
-        return datetime.datetime.now(_IST)
-except ImportError:
-    _IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-    def _now_ist() -> datetime.datetime:
-        return datetime.datetime.now(_IST)
+_IST = pytz.timezone("Asia/Kolkata")
+def _now_ist() -> datetime.datetime:
+    return datetime.datetime.now(_IST)
 
 _IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 def today_ist() -> str:
-    """Always IST date YYYY-MM-DD regardless of server timezone."""
     return _now_ist().strftime("%Y-%m-%d")
 
 def now_utc_iso() -> str:
@@ -70,13 +63,11 @@ def now_utc_iso() -> str:
 
 def ts_to_ms(iso: str) -> int:
     try:
-        return int(datetime.datetime.fromisoformat(
-            iso.replace("Z", "+00:00")).timestamp() * 1000)
+        return int(datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
     except:
         return int(time.time() * 1000)
 
 def ms_to_ist_hhmm(now_ms: int) -> int:
-    """Convert millisecond UTC timestamp → IST HHMM integer."""
     dt = datetime.datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     ist = dt.astimezone(_IST_TZ)
     return ist.hour * 100 + ist.minute
@@ -85,34 +76,26 @@ def ms_to_ist_hhmm(now_ms: int) -> int:
 # SECTION 2 — SESSION HELPERS
 # ══════════════════════════════════════════════════════════════════
 def is_trading_session(hhmm: int) -> bool:
-    """9:30 AM – 2:30 PM IST — new entry window."""
     return TRADE_START <= hhmm <= TRADE_END
 
 def is_new_entry_allowed(now_ms: int = None) -> bool:
-    """New entries only during 9:30 AM – 2:24 PM IST."""
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (
-        _now_ist().hour * 100 + _now_ist().minute)
+    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
     return TRADE_START <= t < PRE_CLOSE
 
 def should_square_off_now(now_ms: int = None) -> bool:
-    """True during 2:25–2:28 PM IST — pre-close window."""
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (
-        _now_ist().hour * 100 + _now_ist().minute)
+    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
     return PRE_CLOSE <= t < FREEZE_ZONE
 
 def is_freeze_zone(now_ms: int = None) -> bool:
-    """True at exactly 2:29 PM IST — dangerous API freeze window."""
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (
-        _now_ist().hour * 100 + _now_ist().minute)
+    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
     return t == FREEZE_ZONE
 
 def is_market_open(now_ms: int = None) -> bool:
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (
-        _now_ist().hour * 100 + _now_ist().minute)
+    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 3 — MOCK REDIS
+# SECTION 3 — REDIS (PRODUCTION SWAP)
 # ══════════════════════════════════════════════════════════════════
 class MockRedis:
     def __init__(self):
@@ -188,10 +171,16 @@ class MockRedis:
     def flushall(self):
         with self._lock: self._s.clear(); self._e.clear()
 
-    def has_expiry(self, k):
-        with self._lock: return k in self._e
-
-r = MockRedis()
+# REAL REDIS CONNECTION LOGIC
+REDIS_URL = os.environ.get("REDIS_URL")
+if REDIS_URL:
+    try:
+        import redis
+        r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    except ImportError:
+        r = MockRedis()
+else:
+    r = MockRedis()
 
 # ══════════════════════════════════════════════════════════════════
 # SECTION 4 — REDIS HELPERS
@@ -275,7 +264,6 @@ class AuditLog:
 # SECTION 6 — PIPELINE GUARD
 # ══════════════════════════════════════════════════════════════════
 def pipeline_guard(func):
-    """Catches unexpected exceptions, logs them, re-raises as ValueError."""
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -288,9 +276,8 @@ def pipeline_guard(func):
     return wrapper
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 7 — API RESILIENCE LAYER (6 AngelOne quirks)
+# SECTION 7 — API RESILIENCE LAYER
 # ══════════════════════════════════════════════════════════════════
-
 def fetch_ltp_with_retry(
     client, exchange: str, symbol: str, token: str,
     max_retries: int = MAX_RETRIES,
@@ -473,47 +460,18 @@ def check_capital_live(client, order_cost: float) -> dict:
     return {**cap, "order_cost": order_cost, "max_use": max_use, "ok": True}
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 8 — MOCK ANGEL ONE
+# SECTION 8 — ANGEL ONE CLIENT SETUP (PRODUCTION SWAP)
 # ══════════════════════════════════════════════════════════════════
 class MockAngelOne:
-    def __init__(self,
-                 ltp=150.0,
-                 fail=False,
-                 ltp_fail_n=0,
-                 ltp_delay_sec=0.0,
-                 depth_missing=False,
-                 order_delay_n=0,
-                 rms_available=200000,
-                 rms_fail=False,
-                 spread=1.0,
-                 vol=2000,
-                 oi=50000):
-        self.ltp          = ltp
-        self._fail        = fail
-        self._ltp_calls   = 0
-        self._ltp_fail_n  = ltp_fail_n
-        self._ltp_delay   = ltp_delay_sec
-        self._depth_miss  = depth_missing
-        self._ob_calls    = 0
-        self._ob_delay_n  = order_delay_n
-        self._rms_avail   = rms_available
-        self._rms_fail    = rms_fail
-        self._spread      = spread
-        self._vol         = vol
-        self._oi          = oi
-        self._orders      = {}
-        self._ctr         = 1000
+    def __init__(self, ltp=150.0):
+        self.ltp = ltp
+        self._ctr = 1000
+        self._orders = {}
 
     def ltpData(self, exchange, symbol, token):
-        self._ltp_calls += 1
-        if self._ltp_calls <= self._ltp_fail_n:
-            raise Exception("LTP_TIMEOUT")
-        if self._ltp_delay > 0:
-            time.sleep(self._ltp_delay)
         return {"data": {"ltp": self.ltp}}
 
     def placeOrder(self, order):
-        if self._fail: raise Exception("ANGEL_API_ERROR")
         oid = str(self._ctr); self._ctr += 1
         self._orders[oid] = {
             "orderid":      oid,
@@ -525,9 +483,6 @@ class MockAngelOne:
         return {"data": {"orderid": oid}}
 
     def orderBook(self):
-        self._ob_calls += 1
-        if self._ob_calls <= self._ob_delay_n:
-            return {"data": []}
         return {"data": list(self._orders.values())}
 
     def modifyOrder(self, data):
@@ -537,31 +492,45 @@ class MockAngelOne:
         return {"status": "success"}
 
     def getMarketData(self, mode, tokens):
-        if self._depth_miss:
-            return {"data": {"fetched": [{
-                "ltp": self.ltp, "tradedVolume": self._vol,
-                "openInterest": self._oi,
-            }]}}
         mid = self.ltp
         return {"data": {"fetched": [{
             "ltp": self.ltp,
             "depth": {
-                "buy":  [{"price": mid - self._spread/2, "quantity": 500}],
-                "sell": [{"price": mid + self._spread/2, "quantity": 500}],
+                "buy":  [{"price": mid - 0.5, "quantity": 500}],
+                "sell": [{"price": mid + 0.5, "quantity": 500}],
             },
-            "tradedVolume": self._vol,
-            "openInterest": self._oi,
-            "ask": mid + self._spread/2,
+            "tradedVolume": 2000,
+            "openInterest": 50000,
+            "ask": mid + 0.5,
         }]}}
 
     def rmsLimit(self):
-        if self._rms_fail: raise Exception("RMS_API_ERROR")
-        avail = self._rms_avail
         return {"data": {
-            "net":           str(avail),
-            "utilisedamt":   str(avail * 0.1),
-            "availablecash": str(avail * 0.9),
+            "net":           "200000",
+            "utilisedamt":   "20000",
+            "availablecash": "180000",
         }}
+
+def get_angel_client():
+    """Returns real AngelOne client if ENV variables exist, else Mock."""
+    api_key = os.environ.get("API_KEY")
+    client_id = os.environ.get("CLIENT_ID")
+    pwd = os.environ.get("PASSWORD")
+    totp_str = os.environ.get("TOTP_STR")
+    
+    if api_key and client_id and pwd and totp_str:
+        try:
+            import pyotp
+            from SmartApi import SmartConnect
+            client = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_str).now()
+            client.generateSession(client_id, pwd, totp)
+            return client
+        except Exception as e:
+            AuditLog.error("ANGEL_LOGIN_FAILED", str(e))
+            raise ValueError(f"LOGIN_ERROR: {str(e)}")
+    
+    return MockAngelOne()
 
 # ══════════════════════════════════════════════════════════════════
 # SECTION 9 — DAY BIAS ENGINE
@@ -891,10 +860,6 @@ def place_order(client, lots: int, token_id: str) -> dict:
         })
         r.expire(f"position:{order_id}", 86400)
 
-        # ---------------------------------------------------------
-        # THE FIX: This is where your code was cut off. I added the 
-        # return statement and the necessary exception handling.
-        # ---------------------------------------------------------
         k_cap=daily_key("capital_used"); r.incrbyfloat(k_cap,premium*qty); r.expire(k_cap,86400)
         daily_incr("trade_count")
         AuditLog.trade(order_id,tok.get("signal",""),qty,premium,sl_price,"PLACED")
@@ -911,7 +876,7 @@ def place_order(client, lots: int, token_id: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 13 — FASTAPI ROUTING (Tying it all together)
+# SECTION 13 — FASTAPI ROUTING (REAL ANGELONE READY)
 # ══════════════════════════════════════════════════════════════════
 @app.get("/")
 async def root():
@@ -923,15 +888,13 @@ async def handle_webhook(request: Request):
         data = await request.json()
         now_ms = int(time.time() * 1000)
         
-        # 1. Validate the incoming webhook against your 18 Safety Gates
+        # 1. Validate the incoming webhook
         validation_result = validate_webhook(data, now_ms)
         
         # 2. Extract basic order details
-        token_id = data.get("candle_id", str(now_ms)) # Using candle_id as unique token identifier
-        lots = 1 # Defaulting to 1 lot if not specified
+        token_id = data.get("candle_id", str(now_ms))
+        lots = 1
         
-        # Note: Your place_order expects the token to be pre-registered in Redis.
-        # This registers the token details temporarily so execution works.
         if not r.hgetall(f"token:{token_id}"):
             r.hset(f"token:{token_id}", mapping={
                 "symbol": data.get("symbol", "UNKNOWN"),
@@ -942,8 +905,8 @@ async def handle_webhook(request: Request):
                 "expiry": str(now_ms + 60000)
             })
             
-        # 3. Setup AngelOne Client (Using your MockAngelOne for safety)
-        client = MockAngelOne() 
+        # 3. Setup Client (Calls Real AngelOne if keys exist)
+        client = get_angel_client()
         
         # 4. Execute Trade Logic
         execution_result = place_order(client, lots, token_id)
@@ -961,4 +924,5 @@ async def handle_webhook(request: Request):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    # NOTE: Railway needs a start command in settings to work perfectly
     uvicorn.run(app, host="0.0.0.0", port=port)
