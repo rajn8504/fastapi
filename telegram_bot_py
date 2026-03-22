@@ -2,8 +2,8 @@
 #  Telegram Trading Bot - PART 1 (Core Framework)
 #  This file is fully compatible with Railway deployment.
 # =============================================================
-
 import telebot
+import telebot.util
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import threading
 import time
