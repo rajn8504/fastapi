@@ -615,3 +615,31 @@ def callback_handler(call):
 
         # Send to main algo
         send_signal_to_algo(signal)
+# =============================================================
+# PART-6: SELF HEALING ENGINE (AUTO RECOVERY + STABILITY)
+# =============================================================
+
+def start_bot():
+    """
+    Self-Healing Infinite Loop:
+    ----------------------------
+    - If Telegram polling fails → Restart automatically
+    - If network breaks → Retry
+    - If JSON parse error → Continue safely
+    - If unknown crash → Cooldown + Restart
+    """
+
+    print("🚀 Telegram Bot Started (Self-Healing Mode Enabled)")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=30,
+                allowed_updates=telebot.util.update_types
+            )
+
+        except Exception as e:
+            print(f"⚠️ BOT ERROR → Auto-Recovering in 2 seconds...\n{e}")
+            time.sleep(2)
+            continue
