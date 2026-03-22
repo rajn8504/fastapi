@@ -1,6 +1,8 @@
+pyTelegramBotAPI
+requests
 fastapi
 uvicorn
-redis
 pytz
-smartapi-python
 python-dotenv
+smartapi-python
+redis
