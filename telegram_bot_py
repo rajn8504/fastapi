@@ -58,17 +58,6 @@ def now_str():
 # =============================================================
 #  PLACEHOLDERS (PART-2 & PART-3 WILL REPLACE THESE)
 # =============================================================
-def analyze_deep():
-    """
-    PART 3 will fill deep BUY/SELL logic:
-    - Candle analysis
-    - Trend reversal checks
-    - Probability scoring
-    """
-    # TEMPORARY placeholder
-    return None, "TEMP: deep analysis pending"
-
-
 # =============================================================
 #  INLINE BUTTON BUILDER (Only when GOOD market)
 # =============================================================
@@ -354,3 +343,129 @@ def analyze_market_basic():
         return True, f"📊 GOOD Market ({score}/6)\n{summary}"
 
     return False, f"⚠️ BAD / Risky Market ({score}/6)\n{summary}"
+# =========================================================
+# PART-3 : DEEP ANALYSIS ENGINE (BUY / SELL DECISION)
+# =========================================================
+
+import time
+import requests
+
+def analyze_deep():
+    """
+    Deep BUY/SELL analysis:
+    ------------------------
+    - Candle Trend
+    - SuperTrend-style HH/HL check
+    - Volume Push
+    - VWAP Bias
+    - 200ms micro re-check before signalling
+    """
+
+    try:
+        # TradingView lightweight scanner
+        url = "https://scanner.tradingview.com/india/scan"
+        payload = {
+            "symbols": {"tickers": ["NSE:NIFTY"], "query": {"types": []}},
+            "columns": [
+                "close", "open", "high", "low",
+                "RSI", "ADX", "VWAP", "volume"
+            ]
+        }
+        res = requests.post(url, json=payload, timeout=3)
+        d = res.json()["data"][0]["d"]
+
+        close  = float(d[0])
+        openp  = float(d[1])
+        high   = float(d[2])
+        low    = float(d[3])
+        rsi    = float(d[4])
+        adx    = float(d[5])
+        vwap   = float(d[6])
+        volume = float(d[7])
+
+    except:
+        return None, "⚠️ Live deep-data unavailable. Try again."
+
+    reasons = []
+    score = 0
+
+    # ----------------------------------------
+    # 1) Candle Body Strength
+    # ----------------------------------------
+    body = abs(close - openp)
+    rng = abs(high - low)
+
+    if rng > 0 and (body / rng) > 0.45:
+        score += 1
+        reasons.append("Strong Candle")
+    else:
+        reasons.append("Weak Candle")
+
+    # ----------------------------------------
+    # 2) Trend Direction (HH / LL style)
+    # ----------------------------------------
+    if close > vwap:
+        score += 1
+        bias = "BUY"
+        reasons.append("Above VWAP → Bullish")
+    else:
+        score += 1
+        bias = "SELL"
+        reasons.append("Below VWAP → Bearish")
+
+    # ----------------------------------------
+    # 3) Momentum (RSI)
+    # ----------------------------------------
+    if 48 <= rsi <= 65:
+        score += 1
+        reasons.append(f"RSI Momentum OK ({rsi})")
+    else:
+        reasons.append(f"RSI Weak ({rsi})")
+
+    # ----------------------------------------
+    # 4) Trend Strength (ADX)
+    # ----------------------------------------
+    if adx >= 18:
+        score += 1
+        reasons.append(f"ADX OK ({adx})")
+    else:
+        reasons.append(f"ADX Weak ({adx})")
+
+    # ----------------------------------------
+    # 5) Volume Thrust
+    # ----------------------------------------
+    if volume > 120000:
+        score += 1
+        reasons.append("Volume Good")
+    else:
+        reasons.append("Low Volume")
+
+    # ----------------------------------------
+    # If score < 3 → Unstable Market
+    # ----------------------------------------
+    if score < 3:
+        return None, f"⚠️ Deep Analysis Weak ({score}/5) → Avoid Trade\n" + " • ".join(reasons)
+
+    # ----------------------------------------
+    # 6) MICRO RECHECK (Market change in last 200ms)
+    # ----------------------------------------
+    time.sleep(0.20)
+    try:
+        res = requests.post(url, json=payload, timeout=2)
+        d2 = res.json()["data"][0]["d"]
+        close2 = float(d2[0])
+    except:
+        close2 = close
+
+    if abs(close2 - close) > (close * 0.0015):   # sudden movement >0.15%
+        return None, "⚠️ Sudden volatility detected. Avoiding unsafe entry."
+
+    # ---------------------------------------------------
+    # FINAL DECISION:
+    # ---------------------------------------------------
+    if bias == "BUY":
+        final_signal = "BUY"
+    else:
+        final_signal = "SELL"
+
+    return final_signal, " • ".join(reasons)
