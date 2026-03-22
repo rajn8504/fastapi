@@ -469,3 +469,76 @@ def analyze_deep():
         final_signal = "SELL"
 
     return final_signal, " • ".join(reasons)
+# =============================================================
+# PART-4: INLINE BUTTON SYSTEM + USER FLOW POLISH
+# =============================================================
+
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+def get_proceed_button():
+    """
+    Only shown when MARKET IS GOOD
+    User presses this → Deep Analysis starts instantly
+    """
+    markup = InlineKeyboardMarkup(row_width=1)
+    go = InlineKeyboardButton(
+        "✅ PROCEED (Deep Analysis)",
+        callback_data="DO_DEEP"
+    )
+    markup.add(go)
+    return markup
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    global trade_lock, market_ok
+
+    if call.from_user.id != USER_ID:
+        return
+
+    # -------------------------------------------------
+    # BUTTON PRESSED → Deep Analysis
+    # -------------------------------------------------
+    if call.data == "DO_DEEP":
+
+        # Safety: prevent execution in bad market
+        if not market_ok:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ Market changed. Deep Analysis cancelled."
+            )
+            return
+
+        # Prevent duplicate trade
+        if trade_lock:
+            bot.answer_callback_query(
+                call.id,
+                "⛔ Trade already in progress..."
+            )
+            return
+
+        bot.answer_callback_query(call.id, "🔍 Deep Analysis Running…")
+        trade_lock = True
+
+        # Execute deep analysis
+        signal, reason = analyze_deep()
+
+        if signal is None:
+            bot.send_message(
+                USER_ID,
+                f"⚠️ Deep Analysis Failed:\n{reason}"
+            )
+            trade_lock = False
+            return
+
+        # Show analysis result
+        bot.send_message(
+            USER_ID,
+            f"📊 <b>Deep Analysis Result</b>\n"
+            f"{reason}\n\n"
+            f"👉 Final Decision: <b>{signal}</b>"
+        )
+
+        # Send to main algo
+        send_signal_to_algo(signal)
