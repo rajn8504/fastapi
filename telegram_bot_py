@@ -3,139 +3,212 @@ import time
 import requests
 import pytz
 import telebot
+import telebot.util
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# 1. ENV CONFIG & SAFETY CHECK
+# =============================================================
+# 1. ENV CONFIG & INITIALIZATION
+# =============================================================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-USER_ID_STR = os.getenv("TELEGRAM_USER_ID", "0")
+USER_ID = int(os.getenv("TELEGRAM_USER_ID", 0))
 ALGO_URL = os.getenv("ALGO_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-if not TOKEN or not ALGO_URL:
-    raise Exception("CRITICAL: Environment Variables are missing!")
+if not TOKEN:
+    raise Exception("TELEGRAM_BOT_TOKEN missing!")
 
-USER_ID = int(USER_ID_STR)
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 IST = pytz.timezone("Asia/Kolkata")
 
 # Internal State
 market_ok = False
 trade_lock = False
-last_analysis_time = 0
 
-# 2. UTILITIES
+# =============================================================
+# 2. UTILITIES & RESET
+# =============================================================
 def reset_state():
     global market_ok, trade_lock
     market_ok = False
     trade_lock = False
+    print("🔄 BOT STATE RESET COMPLETED")
 
 def get_proceed_button():
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ PROCEED (Trade Now)", callback_data="DO_DEEP"))
+    markup = InlineKeyboardMarkup(row_width=1)
+    btn = InlineKeyboardButton("✅ PROCEED (Deep Analysis)", callback_data="DO_DEEP")
+    markup.add(btn)
     return markup
 
-# 3. ROBUST DATA FETCHING
+# =============================================================
+# 3. MARKET DATA ENGINE (TradingView & NSE)
+# =============================================================
 def fetch_tv_data():
+    """TradingView-லிருந்து நேரடி தரவுகளை எடுக்கும்"""
     try:
         url = "https://scanner.tradingview.com/india/scan"
-        # Columns must match EXACTLY in capitalization later
-        cols = ["close", "open", "high", "low", "volume", "RSI", "ADX", "VWAP"]
         payload = {
             "symbols": {"tickers": ["NSE:NIFTY"]},
-            "columns": cols
+            "columns": ["close", "open", "high", "low", "volume", "RSI", "ADX", "VWAP"]
         }
-        res = requests.post(url, json=payload, timeout=10)
-        json_data = res.json()
-        if "data" not in json_data or not json_data["data"]:
-            return None
-            
-        d = json_data["data"][0]["d"]
-        return dict(zip(cols, d))
+        res = requests.post(url, json=payload, timeout=5)
+        d = res.json()["data"][0]["d"]
+
+        columns = ["close","open","high","low","volume","rsi","adx","vwap"]
+        mapped = dict(zip(columns, d))
+
+        return {
+            "close": float(mapped["close"]),
+            "open": float(mapped["open"]),
+            "high": float(mapped["high"]),
+            "low": float(mapped["low"]),
+            "volume": float(mapped["volume"]),
+            "rsi": float(mapped["rsi"]),
+            "adx": float(mapped["adx"]),
+            "vwap": float(mapped["vwap"])
+        }
     except Exception as e:
-        print(f"Fetch Error: {e}")
+        print("TV ERROR:", e)
         return None
 
 def analyze_market_basic():
+    """அடிப்படை சந்தை ஆய்வு (Score 4/6)"""
     data = fetch_tv_data()
     if not data:
-        return False, "⚠️ Data unavailable. Connection issue."
+        return False, "⚠️ Live market data unavailable. Avoid entry."
 
     score = 0
-    # Calculations with correct Case-Sensitivity (VWAP, RSI, ADX)
-    if data['close'] > data['open']: score += 1
-    if abs(data['close'] - data['VWAP']) / data['VWAP'] * 100 < 0.30: score += 1
-    if 35 <= data['RSI'] <= 65: score += 1
-    if data['ADX'] > 15: score += 1
-    if data['volume'] > 50000: score += 1
+    reasons = []
+    
+    # Logic Checks
+    if data['close'] > data['open']: 
+        score += 1
+        reasons.append("Trend: Bullish")
+    elif data['close'] < data['open']:
+        score += 1
+        reasons.append("Trend: Bearish")
 
-    if score >= 3:
-        return True, f"✅ Market Stable (Score: {score}/5)"
-    return False, f"❌ Market Risky (Score: {score}/5)"
+    dist = abs(data['close'] - data['vwap']) / data['vwap'] * 100
+    if dist < 0.25:
+        score += 1
+        reasons.append("VWAP Close")
 
+    if 40 <= data['rsi'] <= 60:
+        score += 1
+        reasons.append("RSI Neutral")
+
+    if data['adx'] > 18:
+        score += 1
+        reasons.append("ADX Strong")
+
+    if data['volume'] > 100000:
+        score += 1
+        reasons.append("Volume Good")
+
+    summary = " • ".join(reasons)
+    if score >= 4:
+        return True, f"📊 <b>GOOD Market</b> ({score}/6)\n{summary}"
+    return False, f"⚠️ <b>Risky Market</b> ({score}/6)\n{summary}"
+
+def analyze_deep():
+    """ஆழ்ந்த ஆய்வு மற்றும் BUY/SELL முடிவு"""
+    data = fetch_tv_data()
+    if not data: 
+        return None, "Data Error"
+    
+    bias = "BUY" if data['close'] > data['vwap'] else "SELL"
+    reasons = [f"Bias: {bias}", f"RSI: {data['rsi']:.1f}"]
+
+    time.sleep(0.2)
+    data2 = fetch_tv_data()
+    if data2 and abs(data2['close'] - data['close']) > (data['close'] * 0.0015):
+        return None, "Sudden volatility detected!"
+
+    return bias, " • ".join(reasons)
+
+# =============================================================
 # 4. ALGO WEBHOOK EXECUTION
+# =============================================================
 def send_signal_to_algo(signal):
     global trade_lock
-    payload = {"secret": WEBHOOK_SECRET, "signal": signal, "symbol": "NIFTY"}
-    try:
-        res = requests.post(ALGO_URL, json=payload, timeout=15)
-        res_data = res.json()
-        if res_data.get("status") == "Success":
-            bot.send_message(USER_ID, "🚀 <b>ORDER PLACED SUCCESSFULLY!</b>")
-        else:
-            bot.send_message(USER_ID, f"❌ Algo Rejected: {res_data.get('message', 'Unknown Error')}")
-    except Exception as e:
-        bot.send_message(USER_ID, f"❌ Critical: Algo Server Unreachable!\nError: {str(e)}")
-    
-    reset_state()
+    payload = {
+        "secret": WEBHOOK_SECRET,
+        "signal": signal,
+        "symbol": "NIFTY",
+        "token": "99926000",
+        "price": "Market"
+    }
 
-# 5. HANDLERS
+    try:
+        res = requests.post(ALGO_URL, json=payload, timeout=8)
+        try:
+            data = res.json()
+        except:
+            bot.send_message(USER_ID, "❌ Algo returned invalid response")
+            trade_lock = False
+            return
+
+        if data.get("status") == "Success":
+            bot.send_message(USER_ID, f"✅ <b>ALGO SUCCESS</b>\n{data.get('details')}")
+            reset_state()
+        else:
+            bot.send_message(USER_ID, f"❌ Algo Error: {data.get('message')}")
+            trade_lock = False
+    except Exception as e:
+        bot.send_message(USER_ID, f"❌ Algo unreachable: {e}")
+        trade_lock = False
+
+# =============================================================
+# 5. TELEGRAM HANDLERS
+# =============================================================
 @bot.callback_query_handler(func=lambda call: call.data == "DO_DEEP")
-def handle_deep(call):
-    global trade_lock, market_ok, last_analysis_time
-    
-    # Timeout check: 120 seconds
-    if time.time() - last_analysis_time > 120:
-        bot.answer_callback_query(call.id, "⏰ Session Expired! Please analyze again.")
-        reset_state()
+def handle_deep_analysis(call):
+    global trade_lock, market_ok
+    if call.from_user.id != USER_ID: 
         return
 
     if not market_ok or trade_lock:
-        bot.answer_callback_query(call.id, "⚠️ Invalid State or Processing...")
+        bot.answer_callback_query(call.id, "⚠️ Invalid Request or Trade in Progress.")
         return
 
     trade_lock = True
-    bot.edit_message_text("🔄 Analyzing Bias & Sending Order...", chat_id=USER_ID, message_id=call.message.message_id)
+    bot.answer_callback_query(call.id, "🔍 Deep Analysis Running...")
     
-    data = fetch_tv_data()
-    if data:
-        bias = "BUY" if data['close'] > data['VWAP'] else "SELL"
-        send_signal_to_algo(bias)
+    signal, reason = analyze_deep()
+    if signal:
+        bot.send_message(USER_ID, f"📊 <b>Deep Analysis Result</b>\n{reason}\n\n👉 Decision: <b>{signal}</b>")
+        send_signal_to_algo(signal)
     else:
-        bot.send_message(USER_ID, "❌ Failed to fetch final bias. Order Cancelled.")
-        reset_state()
+        bot.send_message(USER_ID, f"❌ Deep Analysis Failed: {reason}")
+        trade_lock = False
 
 @bot.message_handler(func=lambda m: True)
-def handle_msg(msg):
-    global market_ok, last_analysis_time
-    # Security Check
+def handle_text(msg):
+    global market_ok
     if msg.from_user.id != USER_ID: 
         return
-    
-    text = msg.text.lower()
+
+    text = msg.text.strip().lower()
     if "market" in text or "மார்க்கெட்" in text:
         bot.send_message(USER_ID, "🔍 அனலைஸ் செய்கிறேன்...")
-        ok, status = analyze_market_basic()
+        ok, status_msg = analyze_market_basic()
         market_ok = ok
-        last_analysis_time = time.time()
         
         if ok:
-            bot.send_message(USER_ID, status, reply_markup=get_proceed_button())
+            bot.send_message(USER_ID, f"{status_msg}\n\n👉 நீங்கள் ஆணை செய்யலாம்.", reply_markup=get_proceed_button())
         else:
-            bot.send_message(USER_ID, status)
+            bot.send_message(USER_ID, f"{status_msg}\n\n⛔ Entry Unsafe.")
+    else:
+        bot.send_message(USER_ID, "❗ தயவு செய்து: 'மார்க்கெட் எப்படி?' என்று கேளுங்கள்.")
 
-# 6. RUN BOT
+# =============================================================
+# 6. START BOT (Self-Healing Loop)
+# =============================================================
 if __name__ == "__main__":
-    print("🚀 Telegram Bot Started (Production Mode)")
-    # Using bot.polling for stable connection on Railway
-    bot.polling(none_stop=True, interval=1, timeout=20)
+    print("🚀 Telegram Bot Started (Railway Mode)")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=20)
+        except Exception as e:
+            print(f"⚠️ Error: {e}. Restarting in 5s...")
+            time.sleep(5)
