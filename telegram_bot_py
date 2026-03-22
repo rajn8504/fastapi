@@ -39,14 +39,18 @@ def get_proceed_button():
 def fetch_tv_data():
     try:
         url = "https://scanner.tradingview.com/india/scan"
+        # Columns must match EXACTLY in capitalization later
         cols = ["close", "open", "high", "low", "volume", "RSI", "ADX", "VWAP"]
         payload = {
             "symbols": {"tickers": ["NSE:NIFTY"]},
             "columns": cols
         }
         res = requests.post(url, json=payload, timeout=10)
-        d = res.json()["data"][0]["d"]
-        # Mapped dictionary for safety
+        json_data = res.json()
+        if "data" not in json_data or not json_data["data"]:
+            return None
+            
+        d = json_data["data"][0]["d"]
         return dict(zip(cols, d))
     except Exception as e:
         print(f"Fetch Error: {e}")
@@ -58,9 +62,9 @@ def analyze_market_basic():
         return False, "⚠️ Data unavailable. Connection issue."
 
     score = 0
-    # Fixing HTML entities (Using proper > and < signs)
+    # Calculations with correct Case-Sensitivity (VWAP, RSI, ADX)
     if data['close'] > data['open']: score += 1
-    if abs(data['close'] - data['vwap']) / data['vwap'] * 100 < 0.30: score += 1
+    if abs(data['close'] - data['VWAP']) / data['VWAP'] * 100 < 0.30: score += 1
     if 35 <= data['RSI'] <= 65: score += 1
     if data['ADX'] > 15: score += 1
     if data['volume'] > 50000: score += 1
@@ -75,13 +79,13 @@ def send_signal_to_algo(signal):
     payload = {"secret": WEBHOOK_SECRET, "signal": signal, "symbol": "NIFTY"}
     try:
         res = requests.post(ALGO_URL, json=payload, timeout=15)
-        res_data = res.json() # Safety check for JSON
+        res_data = res.json()
         if res_data.get("status") == "Success":
-            bot.send_message(USER_ID, "🚀 **ORDER PLACED SUCCESSFULLY!**")
+            bot.send_message(USER_ID, "🚀 <b>ORDER PLACED SUCCESSFULLY!</b>")
         else:
-            bot.send_message(USER_ID, f"❌ Algo Rejected: {res_data.get('message', 'Unknown')}")
-    except:
-        bot.send_message(USER_ID, "❌ Critical: Algo Server Unreachable!")
+            bot.send_message(USER_ID, f"❌ Algo Rejected: {res_data.get('message', 'Unknown Error')}")
+    except Exception as e:
+        bot.send_message(USER_ID, f"❌ Critical: Algo Server Unreachable!\nError: {str(e)}")
     
     reset_state()
 
@@ -90,31 +94,37 @@ def send_signal_to_algo(signal):
 def handle_deep(call):
     global trade_lock, market_ok, last_analysis_time
     
-    # Timeout check: If button pressed after 2 mins
+    # Timeout check: 120 seconds
     if time.time() - last_analysis_time > 120:
-        bot.answer_callback_query(call.id, "⏰ Session Expired! Analyze again.")
+        bot.answer_callback_query(call.id, "⏰ Session Expired! Please analyze again.")
         reset_state()
         return
 
     if not market_ok or trade_lock:
-        bot.answer_callback_query(call.id, "⚠️ Already processing or invalid state.")
+        bot.answer_callback_query(call.id, "⚠️ Invalid State or Processing...")
         return
 
     trade_lock = True
-    bot.edit_message_text("🔄 Executing Order...", chat_id=USER_ID, message_id=call.message.message_id)
+    bot.edit_message_text("🔄 Analyzing Bias & Sending Order...", chat_id=USER_ID, message_id=call.message.message_id)
     
-    # Quick Deep Check
     data = fetch_tv_data()
-    bias = "BUY" if data['close'] > data['vwap'] else "SELL"
-    send_signal_to_algo(bias)
+    if data:
+        bias = "BUY" if data['close'] > data['VWAP'] else "SELL"
+        send_signal_to_algo(bias)
+    else:
+        bot.send_message(USER_ID, "❌ Failed to fetch final bias. Order Cancelled.")
+        reset_state()
 
 @bot.message_handler(func=lambda m: True)
 def handle_msg(msg):
     global market_ok, last_analysis_time
-    if msg.from_user.id != USER_ID: return
+    # Security Check
+    if msg.from_user.id != USER_ID: 
+        return
     
     text = msg.text.lower()
     if "market" in text or "மார்க்கெட்" in text:
+        bot.send_message(USER_ID, "🔍 அனலைஸ் செய்கிறேன்...")
         ok, status = analyze_market_basic()
         market_ok = ok
         last_analysis_time = time.time()
@@ -127,4 +137,5 @@ def handle_msg(msg):
 # 6. RUN BOT
 if __name__ == "__main__":
     print("🚀 Telegram Bot Started (Production Mode)")
+    # Using bot.polling for stable connection on Railway
     bot.polling(none_stop=True, interval=1, timeout=20)
