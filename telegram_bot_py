@@ -1,136 +1,139 @@
-import os
+# =============================================================
+#  Telegram Trading Bot - PART 1 (Core Framework)
+#  This file is fully compatible with Railway deployment.
+# =============================================================
+
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import threading
 import time
+import os
 import requests
 import pytz
-import telebot
-import telebot.util
 from datetime import datetime
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # =============================================================
-# 1. ENV CONFIG & INITIALIZATION
+#  ENV CONFIG
 # =============================================================
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-USER_ID = int(os.getenv("TELEGRAM_USER_ID", 0))
+USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 ALGO_URL = os.getenv("ALGO_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-if not TOKEN:
-    raise Exception("TELEGRAM_BOT_TOKEN missing!")
-
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-IST = pytz.timezone("Asia/Kolkata")
 
-# Internal State
+# =============================================================
+#  INTERNAL STATE (Will auto-reset after trade)
+# =============================================================
+
 market_ok = False
 trade_lock = False
+last_signal = None
+analysis_cache = {}
 
 # =============================================================
-# 2. UTILITIES & RESET
+#  AUTO RESET FUNCTION
 # =============================================================
+
 def reset_state():
-    global market_ok, trade_lock
+    global market_ok, trade_lock, last_signal, analysis_cache
     market_ok = False
     trade_lock = False
+    last_signal = None
+    analysis_cache = {}
     print("🔄 BOT STATE RESET COMPLETED")
 
+
+# =============================================================
+#  TIME UTILITY
+# =============================================================
+
+IST = pytz.timezone("Asia/Kolkata")
+
+def now_str():
+    return datetime.now(IST).strftime("%H:%M:%S")
+
+
+# =============================================================
+#  PLACEHOLDERS (PART-2 & PART-3 WILL REPLACE THESE)
+# =============================================================
+
+def analyze_market_basic():
+    """
+    PART 2 will fill real analysis:
+    - VWAP
+    - RSI
+    - ADX
+    - VIX
+    - Volume Trend
+    - Breadth
+    """
+    # TEMPORARY PLACEHOLDER (replaced in PART-2)
+    return False, "⚠️ TEMP: Market engine not added yet."
+
+
+def analyze_deep():
+    """
+    PART 3 will fill deep BUY/SELL logic:
+    - Candle analysis
+    - Trend reversal checks
+    - Probability scoring
+    """
+    # TEMPORARY placeholder
+    return None, "TEMP: deep analysis pending"
+
+
+# =============================================================
+#  INLINE BUTTON BUILDER (Only when GOOD market)
+# =============================================================
+
 def get_proceed_button():
-    markup = InlineKeyboardMarkup(row_width=1)
+    markup = InlineKeyboardMarkup()
     btn = InlineKeyboardButton("✅ PROCEED (Deep Analysis)", callback_data="DO_DEEP")
     markup.add(btn)
     return markup
 
-# =============================================================
-# 3. MARKET DATA ENGINE (TradingView & NSE)
-# =============================================================
-def fetch_tv_data():
-    """TradingView-லிருந்து நேரடி தரவுகளை எடுக்கும்"""
-    try:
-        url = "https://scanner.tradingview.com/india/scan"
-        payload = {
-            "symbols": {"tickers": ["NSE:NIFTY"]},
-            "columns": ["close", "open", "high", "low", "volume", "RSI", "ADX", "VWAP"]
-        }
-        res = requests.post(url, json=payload, timeout=5)
-        d = res.json()["data"][0]["d"]
-
-        columns = ["close","open","high","low","volume","rsi","adx","vwap"]
-        mapped = dict(zip(columns, d))
-
-        return {
-            "close": float(mapped["close"]),
-            "open": float(mapped["open"]),
-            "high": float(mapped["high"]),
-            "low": float(mapped["low"]),
-            "volume": float(mapped["volume"]),
-            "rsi": float(mapped["rsi"]),
-            "adx": float(mapped["adx"]),
-            "vwap": float(mapped["vwap"])
-        }
-    except Exception as e:
-        print("TV ERROR:", e)
-        return None
-
-def analyze_market_basic():
-    """அடிப்படை சந்தை ஆய்வு (Score 4/6)"""
-    data = fetch_tv_data()
-    if not data:
-        return False, "⚠️ Live market data unavailable. Avoid entry."
-
-    score = 0
-    reasons = []
-    
-    # Logic Checks
-    if data['close'] > data['open']: 
-        score += 1
-        reasons.append("Trend: Bullish")
-    elif data['close'] < data['open']:
-        score += 1
-        reasons.append("Trend: Bearish")
-
-    dist = abs(data['close'] - data['vwap']) / data['vwap'] * 100
-    if dist < 0.25:
-        score += 1
-        reasons.append("VWAP Close")
-
-    if 40 <= data['rsi'] <= 60:
-        score += 1
-        reasons.append("RSI Neutral")
-
-    if data['adx'] > 18:
-        score += 1
-        reasons.append("ADX Strong")
-
-    if data['volume'] > 100000:
-        score += 1
-        reasons.append("Volume Good")
-
-    summary = " • ".join(reasons)
-    if score >= 4:
-        return True, f"📊 <b>GOOD Market</b> ({score}/6)\n{summary}"
-    return False, f"⚠️ <b>Risky Market</b> ({score}/6)\n{summary}"
-
-def analyze_deep():
-    """ஆழ்ந்த ஆய்வு மற்றும் BUY/SELL முடிவு"""
-    data = fetch_tv_data()
-    if not data: 
-        return None, "Data Error"
-    
-    bias = "BUY" if data['close'] > data['vwap'] else "SELL"
-    reasons = [f"Bias: {bias}", f"RSI: {data['rsi']:.1f}"]
-
-    time.sleep(0.2)
-    data2 = fetch_tv_data()
-    if data2 and abs(data2['close'] - data['close']) > (data['close'] * 0.0015):
-        return None, "Sudden volatility detected!"
-
-    return bias, " • ".join(reasons)
 
 # =============================================================
-# 4. ALGO WEBHOOK EXECUTION
+#  CALLBACK HANDLER (Button Press)
 # =============================================================
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    global trade_lock
+
+    if call.from_user.id != USER_ID:
+        return
+
+    if call.data == "DO_DEEP":
+
+        if trade_lock:
+            bot.answer_callback_query(call.id, "⛔ Trade already in progress.")
+            return
+
+        bot.answer_callback_query(call.id, "🔍 Deep Analysis Running…")
+        trade_lock = True
+
+        signal, reason = analyze_deep()
+
+        if signal is None:
+            bot.send_message(USER_ID, "❌ Deep analysis not implemented yet.")
+            trade_lock = False
+            return
+
+        bot.send_message(USER_ID, f"📊 Deep Analysis Result:\n{reason}\n\n👉 Decision: <b>{signal}</b>")
+
+        send_signal_to_algo(signal)
+
+
+# =============================================================
+#  SEND SIGNAL TO MAIN ALGO
+# =============================================================
+
 def send_signal_to_algo(signal):
     global trade_lock
+
     payload = {
         "secret": WEBHOOK_SECRET,
         "signal": signal,
@@ -141,74 +144,342 @@ def send_signal_to_algo(signal):
 
     try:
         res = requests.post(ALGO_URL, json=payload, timeout=8)
-        try:
-            data = res.json()
-        except:
-            bot.send_message(USER_ID, "❌ Algo returned invalid response")
-            trade_lock = False
-            return
-
-        if data.get("status") == "Success":
-            bot.send_message(USER_ID, f"✅ <b>ALGO SUCCESS</b>\n{data.get('details')}")
-            reset_state()
-        else:
-            bot.send_message(USER_ID, f"❌ Algo Error: {data.get('message')}")
-            trade_lock = False
+        data = res.json()
     except Exception as e:
         bot.send_message(USER_ID, f"❌ Algo unreachable: {e}")
         trade_lock = False
-
-# =============================================================
-# 5. TELEGRAM HANDLERS
-# =============================================================
-@bot.callback_query_handler(func=lambda call: call.data == "DO_DEEP")
-def handle_deep_analysis(call):
-    global trade_lock, market_ok
-    if call.from_user.id != USER_ID: 
         return
 
-    if not market_ok or trade_lock:
-        bot.answer_callback_query(call.id, "⚠️ Invalid Request or Trade in Progress.")
+    # SUCCESS
+    if data.get("status") == "Success":
+        bot.send_message(USER_ID,
+            f"✅ <b>ALGO SUCCESS</b>\n\n"
+            f"{data.get('details')}\n"
+            f"{data.get('analysis_match')}"
+        )
+        reset_state()
         return
 
-    trade_lock = True
-    bot.answer_callback_query(call.id, "🔍 Deep Analysis Running...")
-    
-    signal, reason = analyze_deep()
-    if signal:
-        bot.send_message(USER_ID, f"📊 <b>Deep Analysis Result</b>\n{reason}\n\n👉 Decision: <b>{signal}</b>")
-        send_signal_to_algo(signal)
-    else:
-        bot.send_message(USER_ID, f"❌ Deep Analysis Failed: {reason}")
+    # ERROR FROM ALGO
+    if data.get("status") == "Error":
+        msg = data.get("message", "")
+        bot.send_message(USER_ID, f"❌ Algo Error:\n{msg}")
+
+        if "Unauthorized" in msg:
+            bot.send_message(USER_ID, "⛔ Secret Key invalid!")
         trade_lock = False
+        return
+
+    # UNEXPECTED
+    bot.send_message(USER_ID, f"⚠️ Unknown Algo Response:\n{data}")
+    trade_lock = False
+
+
+# =============================================================
+#  TELEGRAM MESSAGE HANDLER
+# =============================================================
 
 @bot.message_handler(func=lambda m: True)
-def handle_text(msg):
+def handle_message(msg):
     global market_ok
-    if msg.from_user.id != USER_ID: 
+
+    if msg.from_user.id != USER_ID:
         return
 
     text = msg.text.strip().lower()
-    if "market" in text or "மார்க்கெட்" in text:
-        bot.send_message(USER_ID, "🔍 அனலைஸ் செய்கிறேன்...")
-        ok, status_msg = analyze_market_basic()
-        market_ok = ok
-        
+
+    if "மார்க்கெட்" in text or "market" in text:
+        bot.send_message(USER_ID, "🔍 மார்க்கெட் அனலைஸ் செய்கிறேன்…")
+
+        ok, message = analyze_market_basic()
+
         if ok:
-            bot.send_message(USER_ID, f"{status_msg}\n\n👉 நீங்கள் ஆணை செய்யலாம்.", reply_markup=get_proceed_button())
+            market_ok = True
+            bot.send_message(USER_ID,
+                f"📊 மார்க்கெட் நிலை:\n{message}\n\n"
+                f"👉 நீங்கள் ஆணை செய்யலாம்.",
+                reply_markup=get_proceed_button()
+            )
         else:
-            bot.send_message(USER_ID, f"{status_msg}\n\n⛔ Entry Unsafe.")
-    else:
-        bot.send_message(USER_ID, "❗ தயவு செய்து: 'மார்க்கெட் எப்படி?' என்று கேளுங்கள்.")
+            market_ok = False
+            bot.send_message(USER_ID, f"{message}\n\n⛔ Entry Unsafe.")
+
+        return
+
+    bot.send_message(USER_ID, "❗ தயவு செய்து: 'மார்க்கெட் எப்படி?' என்று கேளுங்கள்.")
+
 
 # =============================================================
-# 6. START BOT (Self-Healing Loop)
+#  START BOT (CALLED FROM main.py)
 # =============================================================
-if __name__ == "__main__":
-    print("🚀 Telegram Bot Started (Railway Mode)")
+
+def start_bot():
+    print("🚀 Telegram Bot Started (Thread Mode)")
     while True:
         try:
-            bot.polling(none_stop=True, interval=1, timeout=20)
+            bot.infinity_polling(long_polling_timeout=30, timeout=20)
         except Exception as e:
-            print(f"⚠️ Error: {e}. Restarting in 5s...")
-            time.sleep(5)
+            print("⚠️ BOT ERROR, Restarting:", e)
+            time.sleep(2)
+            continue
+[9:00 pm, 22/03/2026] +91 95245 52233: import requests
+import math
+import statistics
+import time
+from datetime import datetime
+import pytz
+
+# --------------------------------------------
+#  REAL MARKET ANALYSIS ENGINE
+# --------------------------------------------
+
+TV_HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def fetch_tv_candles():
+    """Fetch NIFTY 5-min candles from TradingView Free API"""
+    try:
+        url = "https://scanner.tradingview.com/india/scan"
+        payload = {
+            "symbols": {"tickers": ["NSE:NIFTY"], "query": {"types": []}},
+            "columns": [
+                "close", "open", "high", "low",
+                "volume", "RSI", "ADX", "VWAP"
+            ]
+        }
+        r…
+[9:23 pm, 22/03/2026] +91 95245 52233: # =========================================================
+# PART-3 : DEEP ANALYSIS ENGINE (BUY / SELL DECISION)
+# =========================================================
+
+import time
+import requests
+
+def analyze_deep():
+    """
+    Deep BUY/SELL analysis:
+    ------------------------
+    - Candle Trend
+    - SuperTrend-style HH/HL check
+    - Volume Push
+    - VWAP Bias
+    - 200ms micro re-check before signalling
+    """
+
+    try:
+        # TradingView lightweight scanner
+        url = "https://scanner.tradingview.com/india/scan"
+        payload = {
+            "symbols": {"tickers": ["NSE:NIFTY"], "query": {"types": []}},
+            "columns": [
+                "close", "open", "high", "low",
+                "RSI", "ADX", "VWAP", "volume"
+            ]
+        }
+        res = requests.post(url, json=payload, timeout=3)
+        d = res.json()["data"][0]["d"]
+
+        close  = float(d[0])
+        openp  = float(d[1])
+        high   = float(d[2])
+        low    = float(d[3])
+        rsi    = float(d[4])
+        adx    = float(d[5])
+        vwap   = float(d[6])
+        volume = float(d[7])
+
+    except:
+        return None, "⚠️ Live deep-data unavailable. Try again."
+
+    reasons = []
+    score = 0
+
+    # ----------------------------------------
+    # 1) Candle Body Strength
+    # ----------------------------------------
+    body = abs(close - openp)
+    rng = abs(high - low)
+
+    if rng > 0 and (body / rng) > 0.45:
+        score += 1
+        reasons.append("Strong Candle")
+    else:
+        reasons.append("Weak Candle")
+
+    # ----------------------------------------
+    # 2) Trend Direction (HH / LL style)
+    # ----------------------------------------
+    if close > vwap:
+        score += 1
+        bias = "BUY"
+        reasons.append("Above VWAP → Bullish")
+    else:
+        score += 1
+        bias = "SELL"
+        reasons.append("Below VWAP → Bearish")
+
+    # ----------------------------------------
+    # 3) Momentum (RSI)
+    # ----------------------------------------
+    if 48 <= rsi <= 65:
+        score += 1
+        reasons.append(f"RSI Momentum OK ({rsi})")
+    else:
+        reasons.append(f"RSI Weak ({rsi})")
+
+    # ----------------------------------------
+    # 4) Trend Strength (ADX)
+    # ----------------------------------------
+    if adx >= 18:
+        score += 1
+        reasons.append(f"ADX OK ({adx})")
+    else:
+        reasons.append(f"ADX Weak ({adx})")
+
+    # ----------------------------------------
+    # 5) Volume Thrust
+    # ----------------------------------------
+    if volume > 120000:
+        score += 1
+        reasons.append("Volume Good")
+    else:
+        reasons.append("Low Volume")
+
+    # ----------------------------------------
+    # If score < 3 → Unstable Market
+    # ----------------------------------------
+    if score < 3:
+        return None, f"⚠️ Deep Analysis Weak ({score}/5) → Avoid Trade\n" + " • ".join(reasons)
+
+    # ----------------------------------------
+    # 6) MICRO RECHECK (Market change in last 200ms)
+    # ----------------------------------------
+    time.sleep(0.20)
+    try:
+        res = requests.post(url, json=payload, timeout=2)
+        d2 = res.json()["data"][0]["d"]
+        close2 = float(d2[0])
+    except:
+        close2 = close
+
+    if abs(close2 - close) > (close * 0.0015):   # sudden movement >0.15%
+        return None, "⚠️ Sudden volatility detected. Avoiding unsafe entry."
+
+    # ---------------------------------------------------
+    # FINAL DECISION:
+    # ---------------------------------------------------
+    if bias == "BUY":
+        final_signal = "BUY"
+    else:
+        final_signal = "SELL"
+
+    return final_signal, " • ".join(reasons)
+# =============================================================
+# PART-4: INLINE BUTTON SYSTEM + USER FLOW POLISH
+# =============================================================
+
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+def get_proceed_button():
+    """
+    Only shown when MARKET IS GOOD
+    User presses this → Deep Analysis starts instantly
+    """
+    markup = InlineKeyboardMarkup(row_width=1)
+    go = InlineKeyboardButton(
+        "✅ PROCEED (Deep Analysis)",
+        callback_data="DO_DEEP"
+    )
+    markup.add(go)
+    return markup
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    global trade_lock, market_ok
+
+    if call.from_user.id != USER_ID:
+        return
+
+    # -------------------------------------------------
+    # BUTTON PRESSED → Deep Analysis
+    # -------------------------------------------------
+    if call.data == "DO_DEEP":
+
+        # Safety: prevent execution in bad market
+        if not market_ok:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ Market changed. Deep Analysis cancelled."
+            )
+            return
+
+        # Prevent duplicate trade
+        if trade_lock:
+            bot.answer_callback_query(
+                call.id,
+                "⛔ Trade already in progress..."
+            )
+            return
+
+        bot.answer_callback_query(call.id, "🔍 Deep Analysis Running…")
+        trade_lock = True
+
+        # Execute deep analysis
+        signal, reason = analyze_deep()
+
+        if signal is None:
+            bot.send_message(
+                USER_ID,
+                f"⚠️ Deep Analysis Failed:\n{reason}"
+            )
+            trade_lock = False
+            return
+
+        # Show analysis result
+        bot.send_message(
+            USER_ID,
+            f"📊 <b>Deep Analysis Result</b>\n"
+            f"{reason}\n\n"
+            f"👉 Final Decision: <b>{signal}</b>"
+        )
+
+        # Send to main algo
+        send_signal_to_algo(signal)
+# =============================================================
+# PART-6: SELF HEALING ENGINE (AUTO RECOVERY + STABILITY)
+# =============================================================
+
+def start_bot():
+    """
+    Self-Healing Infinite Loop:
+    ----------------------------
+    - If Telegram polling fails → Restart automatically
+    - If network breaks → Retry
+    - If JSON parse error → Continue safely
+    - If unknown crash → Cooldown + Restart
+    """
+
+    print("🚀 Telegram Bot Started (Self-Healing Mode Enabled)")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=30,
+                allowed_updates=telebot.util.update_types
+            )
+
+        except Exception as e:
+            print(f"⚠️ BOT ERROR → Auto-Recovering in 2 seconds...\n{e}")
+            time.sleep(2)
+            continue
