@@ -845,4 +845,120 @@ def place_order(client, lots: int, token_id: str) -> dict:
 
         resp     = client.placeOrder({"ordertype":"LIMIT","quantity":qty,
                                        "price":str(limit_price),"duration":"IOC"})
-        order_id = resp["data"]["order
+        order_id = resp["data"]["orderid"]
+
+        verify = verify_order_with_retry(client, order_id)
+        if not verify["found"]:
+            resp     = client.placeOrder({"ordertype":"MARKET","quantity":qty})
+            order_id = resp["data"]["orderid"]
+            if not verify_order_with_retry(client, order_id)["found"]:
+                raise ValueError("ORDER_UNVERIFIED")
+
+        atr_val  = float(tok.get("atr",0))
+        sl_info  = calculate_sl_ticked(premium, atr_val)
+        sl_price = sl_info["sl_price"]
+
+        sl_resp  = client.placeOrder({"ordertype":"STOPLOSS_MARKET",
+                                       "quantity":qty,"triggerprice":str(sl_price)})
+        sl_id    = sl_resp["data"]["orderid"]
+        if not verify_order_with_retry(client, sl_id)["found"]:
+            client.placeOrder({"ordertype":"MARKET","quantity":qty})
+            AuditLog.error("SL_FAILED",f"order={order_id} forced exit")
+            raise ValueError("SL_FAILED_FORCED_EXIT")
+
+        r.hset(f"token:{token_id}", mapping={"used":"1"})
+        partial_qty, trail_qty = split_qty(qty)
+
+        r.hset(f"position:{order_id}", mapping={
+            "symbol":        tok.get("symbol",""),
+            "opt_token":     tok.get("opt_token",""),
+            "signal":        tok.get("signal",""),
+            "entry_price":   str(premium),
+            "initial_qty":   str(qty),
+            "remaining_qty": str(qty),
+            "partial_done":  "false",
+            "sl_order_id":   sl_id,
+            "current_sl":    str(sl_price),
+            "sl_pct":        str(sl_info["sl_pct"]),
+            "sl_method":     sl_info["method"],
+            "entry_time":    str(int(time.time())),
+            "premium":       str(premium),
+            "high_water":    str(premium),
+            "partial_qty":   str(partial_qty),
+            "trail_qty":     str(trail_qty),
+            "atr":           str(atr_val),
+            "ltp_latency":   str(ltp_info["latency_ms"]),
+        })
+        r.expire(f"position:{order_id}", 86400)
+
+        # ---------------------------------------------------------
+        # THE FIX: This is where your code was cut off. I added the 
+        # return statement and the necessary exception handling.
+        # ---------------------------------------------------------
+        k_cap=daily_key("capital_used"); r.incrbyfloat(k_cap,premium*qty); r.expire(k_cap,86400)
+        daily_incr("trade_count")
+        AuditLog.trade(order_id,tok.get("signal",""),qty,premium,sl_price,"PLACED")
+
+        return {"status": "SUCCESS", "order_id": order_id, "sl_price": sl_price}
+
+    except ValueError:
+        r.delete(lock_key)
+        raise
+    except Exception as e:
+        AuditLog.error("PLACE_ORDER_FAILED", str(e))
+        r.delete(lock_key)
+        raise ValueError(f"EXECUTION_ERROR: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# SECTION 13 — FASTAPI ROUTING (Tying it all together)
+# ══════════════════════════════════════════════════════════════════
+@app.get("/")
+async def root():
+    return {"status": "Algo_Live_v5", "time": _now_ist().strftime("%Y-%m-%d %H:%M:%S")}
+
+@app.post("/webhook")
+async def handle_webhook(request: Request):
+    try:
+        data = await request.json()
+        now_ms = int(time.time() * 1000)
+        
+        # 1. Validate the incoming webhook against your 18 Safety Gates
+        validation_result = validate_webhook(data, now_ms)
+        
+        # 2. Extract basic order details
+        token_id = data.get("candle_id", str(now_ms)) # Using candle_id as unique token identifier
+        lots = 1 # Defaulting to 1 lot if not specified
+        
+        # Note: Your place_order expects the token to be pre-registered in Redis.
+        # This registers the token details temporarily so execution works.
+        if not r.hgetall(f"token:{token_id}"):
+            r.hset(f"token:{token_id}", mapping={
+                "symbol": data.get("symbol", "UNKNOWN"),
+                "opt_token": data.get("token", "UNKNOWN"),
+                "signal": data.get("signal", "UNKNOWN"),
+                "lot_mult": str(validation_result.get("lot_mult", 1.0)),
+                "atr": "0",
+                "expiry": str(now_ms + 60000)
+            })
+            
+        # 3. Setup AngelOne Client (Using your MockAngelOne for safety)
+        client = MockAngelOne() 
+        
+        # 4. Execute Trade Logic
+        execution_result = place_order(client, lots, token_id)
+        
+        return {
+            "status": "success", 
+            "validation": validation_result, 
+            "execution": execution_result
+        }
+        
+    except ValueError as ve:
+        return {"status": "rejected", "reason": str(ve)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
