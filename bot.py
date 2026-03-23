@@ -5,46 +5,69 @@
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
-import telebot
-import telebot.util
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import threading
-import time
 import os
-import requests
-import pytz
-import math
-import json
 import sys
 import gc
+import json
+import time
+import threading
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+
+# Flask for health check endpoint (Railway requirement)
+try:
+    from flask import Flask, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+
+# Telebot
+try:
+    import telebot
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+except ImportError:
+    print("❌ telebot not installed. Run: pip install pyTelegramBotAPI")
+    sys.exit(1)
+
+# Requests
+try:
+    import requests
+except ImportError:
+    print("❌ requests not installed. Run: pip install requests")
+    sys.exit(1)
+
+# Timezone
+try:
+    import pytz
+except ImportError:
+    print("❌ pytz not installed. Run: pip install pytz")
+    sys.exit(1)
 
 # =============================================================
-#  FORCE GARBAGE COLLECTION
+#  GARBAGE COLLECTION
 # =============================================================
-
-def cleanup():
-    """Force garbage collection to free memory"""
+def cleanup() -> None:
+    """Force garbage collection"""
     gc.collect()
 
 # =============================================================
-#  ENV CONFIG WITH ERROR HANDLING
+#  ENV CONFIG
 # =============================================================
-
-def get_env_var(name: str, required: bool = True) -> Optional[str]:
+def get_env_var(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
     """Safe environment variable getter"""
-    value = os.getenv(name)
+    value = os.getenv(name, default)
     if required and not value:
         print(f"❌ ERROR: Missing required environment variable: {name}")
         sys.exit(1)
     return value
 
+# Get credentials
 TOKEN = get_env_var("TELEGRAM_BOT_TOKEN")
 USER_ID = int(get_env_var("TELEGRAM_USER_ID"))
-ALGO_URL = get_env_var("ALGO_URL")
+ALGO_URL = get_env_var("ALGO_URL", required=False)
 WEBHOOK_SECRET = get_env_var("WEBHOOK_SECRET", required=False)
 
+# Initialize bot
 try:
     bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
     print("✅ Bot initialized successfully")
@@ -55,14 +78,13 @@ except Exception as e:
 # =============================================================
 #  THREAD-SAFE STATE MANAGEMENT
 # =============================================================
-
 class ThreadSafeState:
     def __init__(self):
         self._lock = threading.Lock()
         self.market_ok = False
         self.trade_lock = False
-        self.analysis_cache = {}
-        self.last_market_check = 0
+        self.analysis_cache: Dict = {}
+        self.last_market_check = 0.0
     
     def get_market_ok(self) -> bool:
         with self._lock:
@@ -80,14 +102,6 @@ class ThreadSafeState:
         with self._lock:
             self.trade_lock = value
     
-    def get_last_market_check(self) -> float:
-        with self._lock:
-            return self.last_market_check
-    
-    def set_last_market_check(self, value: float) -> None:
-        with self._lock:
-            self.last_market_check = value
-    
     def get_analysis_cache(self) -> Dict:
         with self._lock:
             return self.analysis_cache.copy()
@@ -95,6 +109,14 @@ class ThreadSafeState:
     def set_analysis_cache(self, value: Dict) -> None:
         with self._lock:
             self.analysis_cache = value
+    
+    def get_last_market_check(self) -> float:
+        with self._lock:
+            return self.last_market_check
+    
+    def set_last_market_check(self, value: float) -> None:
+        with self._lock:
+            self.last_market_check = value
     
     def reset(self) -> None:
         with self._lock:
@@ -109,12 +131,11 @@ MARKET_CACHE_DURATION = 15
 # =============================================================
 #  THREAD-SAFE RATE LIMITER
 # =============================================================
-
 class ThreadSafeRateLimiter:
     def __init__(self, min_interval: float = 0.5):
         self.min_interval = min_interval
         self._lock = threading.Lock()
-        self.last_call = 0
+        self.last_call = 0.0
     
     def wait(self) -> None:
         with self._lock:
@@ -128,7 +149,6 @@ rate_limiter = ThreadSafeRateLimiter(0.5)
 # =============================================================
 #  SAFE JSON FETCHER
 # =============================================================
-
 def safe_json_fetch(url: str, payload: Dict = None, headers: Dict = None,
                    method: str = 'POST', timeout: int = 15, retries: int = 3) -> Optional[Dict]:
     """Safe JSON fetcher with retry logic"""
@@ -140,18 +160,15 @@ def safe_json_fetch(url: str, payload: Dict = None, headers: Dict = None,
                 response = requests.get(url, headers=headers, timeout=timeout)
             
             response.raise_for_status()
-            
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                print(f"Invalid JSON (attempt {attempt + 1})")
-                if attempt == retries - 1:
-                    return None
-                time.sleep(2)
-                continue
+            return response.json()
                 
         except requests.exceptions.RequestException as e:
             print(f"Request error (attempt {attempt + 1}): {e}")
+            if attempt == retries - 1:
+                return None
+            time.sleep(2)
+        except json.JSONDecodeError:
+            print(f"Invalid JSON (attempt {attempt + 1})")
             if attempt == retries - 1:
                 return None
             time.sleep(2)
@@ -161,7 +178,6 @@ def safe_json_fetch(url: str, payload: Dict = None, headers: Dict = None,
 # =============================================================
 #  TIME UTILITY
 # =============================================================
-
 IST = pytz.timezone("Asia/Kolkata")
 
 def now_str() -> str:
@@ -176,7 +192,6 @@ def is_trading_time() -> bool:
 # =============================================================
 #  FALLBACK MARKET DATA
 # =============================================================
-
 def get_fallback_market_data() -> Dict:
     """Generate fallback market data"""
     return {
@@ -191,15 +206,14 @@ def get_fallback_market_data() -> Dict:
     }
 
 # =============================================================
-#  TV CANDLES FETCHER - SIMPLIFIED
+#  TV CANDLES FETCHER
 # =============================================================
-
 TV_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
 }
 
-def fetch_tv_candles() -> Optional[Dict]:
+def fetch_tv_candles() -> Dict:
     """Fetch current NIFTY candles"""
     rate_limiter.wait()
     
@@ -220,37 +234,29 @@ def fetch_tv_candles() -> Optional[Dict]:
         if len(values) < 5:
             return get_fallback_market_data()
         
-        try:
-            close = float(values[0])
-            openp = float(values[1])
-            high = float(values[2])
-            low = float(values[3])
-            volume = float(values[4]) if len(values) > 4 else 100000
-            
-            # Simple calculations
-            typical_price = (high + low + close) / 3
-            vwap = round(typical_price, 2)
-            
-            # Approximate RSI
-            rsi = 55.0 if close > openp else 45.0
-            
-            # Approximate ADX
-            range_pct = (high - low) / close * 100
-            adx = 25.0 if range_pct > 0.5 else 20.0
-            
-            return {
-                "close": close,
-                "open": openp,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "rsi": rsi,
-                "adx": adx,
-                "vwap": vwap,
-            }
-        except Exception as e:
-            print(f"Parse error: {e}")
-            return get_fallback_market_data()
+        close = float(values[0])
+        openp = float(values[1])
+        high = float(values[2])
+        low = float(values[3])
+        volume = float(values[4]) if len(values) > 4 else 100000
+        
+        # Simple calculations
+        typical_price = (high + low + close) / 3
+        vwap = round(typical_price, 2)
+        rsi = 55.0 if close > openp else 45.0
+        range_pct = (high - low) / close * 100 if close > 0 else 0
+        adx = 25.0 if range_pct > 0.5 else 20.0
+        
+        return {
+            "close": close,
+            "open": openp,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "rsi": rsi,
+            "adx": adx,
+            "vwap": vwap,
+        }
             
     except Exception as e:
         print(f"TV fetch error: {e}")
@@ -259,15 +265,10 @@ def fetch_tv_candles() -> Optional[Dict]:
 # =============================================================
 #  HISTORICAL CANDLES
 # =============================================================
-
 def fetch_historical_candles(minutes: int = 60) -> List[Dict]:
     """Generate historical candles"""
     candles = []
     current_data = fetch_tv_candles()
-    
-    if not current_data:
-        current_data = get_fallback_market_data()
-    
     current_close = current_data["close"]
     current_volume = current_data["volume"]
     
@@ -297,53 +298,45 @@ def fetch_historical_candles(minutes: int = 60) -> List[Dict]:
             "close": round(candle_close, 2),
             "volume": round(volume, 0)
         })
-        
-        cleanup()
     
+    cleanup()
     return candles
 
 # =============================================================
 #  VIX FETCHER
 # =============================================================
-
-def fetch_vix() -> Optional[float]:
+def fetch_vix() -> float:
     """Fetch VIX with fallback"""
-    try:
-        # Simple fallback - don't risk NSE blocking
-        return 16.5
-    except:
-        return 16.5
+    return 16.5
 
 # =============================================================
 #  PATTERN DETECTION
 # =============================================================
-
 def detect_candlestick_patterns(candles: List[Dict]) -> Dict[str, bool]:
     """Detect patterns"""
-    if len(candles) < 3:
+    if len(candles) < 2:
         return {}
     
     patterns = {}
+    latest = candles[-1]
+    prev = candles[-2] if len(candles) > 1 else candles[-1]
     
     try:
-        latest = candles[-1]
-        prev = candles[-2]
+        latest_open = latest.get('open', 0) or 0
+        latest_close = latest.get('close', 0) or 0
+        latest_high = latest.get('high', 0) or 0
+        latest_low = latest.get('low', 0) or 0
         
-        latest_open = latest.get('open', 0)
-        latest_close = latest.get('close', 0)
-        latest_high = latest.get('high', 0)
-        latest_low = latest.get('low', 0)
-        
-        prev_open = prev.get('open', 0)
-        prev_close = prev.get('close', 0)
+        prev_open = prev.get('open', 0) or 0
+        prev_close = prev.get('close', 0) or 0
         
         if latest_close <= 0 or latest_open <= 0:
             return {}
         
         body = abs(latest_close - latest_open)
-        range_ = latest_high - latest_low
+        range_val = latest_high - latest_low
         
-        if range_ <= 0:
+        if range_val <= 0:
             return {}
         
         prev_body = prev_close - prev_open
@@ -359,7 +352,7 @@ def detect_candlestick_patterns(candles: List[Dict]) -> Dict[str, bool]:
             patterns['bearish_engulfing'] = True
         
         # Doji
-        if body / range_ < 0.1:
+        if body / range_val < 0.1:
             patterns['doji'] = True
         
     except Exception as e:
@@ -370,7 +363,6 @@ def detect_candlestick_patterns(candles: List[Dict]) -> Dict[str, bool]:
 # =============================================================
 #  SUPPORT/RESISTANCE
 # =============================================================
-
 def calculate_support_resistance(candles: List[Dict]) -> Dict[str, float]:
     """Calculate S/R levels"""
     if not candles or len(candles) < 5:
@@ -379,8 +371,8 @@ def calculate_support_resistance(candles: List[Dict]) -> Dict[str, float]:
     try:
         recent = candles[-20:] if len(candles) >= 20 else candles
         
-        highs = [c.get('high', 0) for c in recent if c.get('high', 0) > 0]
-        lows = [c.get('low', 0) for c in recent if c.get('low', 0) > 0]
+        highs = [c.get('high', 0) for c in recent if c.get('high', 0)]
+        lows = [c.get('low', 0) for c in recent if c.get('low', 0)]
         
         if not highs or not lows:
             return {"s1": 0, "r1": 0, "pivot": 0}
@@ -405,9 +397,8 @@ def calculate_support_resistance(candles: List[Dict]) -> Dict[str, float]:
 # =============================================================
 #  MARKET ANALYSIS
 # =============================================================
-
 def analyze_market_basic() -> Tuple[bool, str]:
-    """Market analysis"""
+    """Basic market analysis"""
     
     if time.time() - state.get_last_market_check() < MARKET_CACHE_DURATION:
         cache = state.get_analysis_cache()
@@ -415,9 +406,6 @@ def analyze_market_basic() -> Tuple[bool, str]:
             return cache.get("ok", False), cache.get("message", "")
     
     data = fetch_tv_candles()
-    if data is None:
-        data = get_fallback_market_data()
-    
     candles = fetch_historical_candles(60)
     
     close = data["close"]
@@ -434,7 +422,7 @@ def analyze_market_basic() -> Tuple[bool, str]:
     if close > openp:
         score += 1
         reasons.append("📈 Bullish")
-    elif close < openp:
+    else:
         score += 1
         reasons.append("📉 Bearish")
     
@@ -453,10 +441,10 @@ def analyze_market_basic() -> Tuple[bool, str]:
     # ADX
     if adx > 25:
         score += 2
-        reasons.append(f"📊 Strong Trend")
+        reasons.append("📊 Strong Trend")
     elif adx > 18:
         score += 1
-        reasons.append(f"📊 Moderate Trend")
+        reasons.append("📊 Moderate Trend")
     
     # Volume
     if volume > 150000:
@@ -468,7 +456,7 @@ def analyze_market_basic() -> Tuple[bool, str]:
     
     # VIX
     vix = fetch_vix()
-    if vix and vix < 18:
+    if vix < 18:
         score += 1
         reasons.append(f"🛡️ VIX: Low")
     
@@ -492,22 +480,15 @@ def analyze_market_basic() -> Tuple[bool, str]:
 # =============================================================
 #  DEEP ANALYSIS
 # =============================================================
-
 def analyze_deep() -> Tuple[Optional[str], str]:
-    """Deep analysis"""
+    """Deep analysis for signal generation"""
     
     data = fetch_tv_candles()
-    if data is None:
-        data = get_fallback_market_data()
-    
     candles = fetch_historical_candles(60)
     patterns = detect_candlestick_patterns(candles)
-    sr = calculate_support_resistance(candles)
     
     close = data["close"]
     openp = data["open"]
-    high = data["high"]
-    low = data["low"]
     rsi = data["rsi"]
     adx = data["adx"]
     vwap = data["vwap"]
@@ -535,20 +516,20 @@ def analyze_deep() -> Tuple[Optional[str], str]:
         else:
             bias = "SELL"
             score += 1
-        reasons.append(f"📊 {bias} signal from VWAP")
+        reasons.append(f"📊 {bias} from VWAP")
     
     # RSI
     if bias == "BUY" and 48 <= rsi <= 70:
         score += 1
-        reasons.append(f"⚡ RSI confirms")
+        reasons.append("⚡ RSI confirms")
     elif bias == "SELL" and 30 <= rsi <= 52:
         score += 1
-        reasons.append(f"⚡ RSI confirms")
+        reasons.append("⚡ RSI confirms")
     
     # ADX
     if adx >= 25:
         score += 2
-        reasons.append(f"📊 Strong Trend")
+        reasons.append("📊 Strong Trend")
     
     # Volume
     if volume > 150000:
@@ -562,47 +543,61 @@ def analyze_deep() -> Tuple[Optional[str], str]:
     return final_signal, f"✅ Signal ({score}/12)\n\n" + "\n".join(reasons)
 
 # =============================================================
-#  BUTTONS & CALLBACKS
+#  KEYBOARD MARKUPS
 # =============================================================
-
 def get_proceed_button() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(InlineKeyboardButton("✅ PROCEED", callback_data="DO_DEEP"))
     return markup
 
+# =============================================================
+#  CALLBACK HANDLER
+# =============================================================
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call) -> None:
-    if call.from_user.id != USER_ID:
-        bot.answer_callback_query(call.id, "⛔ Unauthorized")
-        return
-    
-    if call.data == "DO_DEEP":
-        if not state.get_market_ok():
-            bot.answer_callback_query(call.id, "⚠️ Market changed")
+    try:
+        if call.from_user.id != USER_ID:
+            bot.answer_callback_query(call.id, "⛔ Unauthorized")
             return
         
-        if state.get_trade_lock():
-            bot.answer_callback_query(call.id, "⛔ Trade in progress")
-            return
-        
-        bot.answer_callback_query(call.id, "🔍 Analyzing...")
-        state.set_trade_lock(True)
-        
-        signal, reason = analyze_deep()
-        
-        if signal is None:
-            bot.send_message(USER_ID, f"⚠️ Failed:\n{reason}")
-            state.set_trade_lock(False)
-            return
-        
-        bot.send_message(USER_ID, f"📊 Result:\n{reason}\n\n👉 <b>{signal}</b>")
-        
-        if ALGO_URL:
-            send_signal_to_algo(signal)
-        else:
-            bot.send_message(USER_ID, "✅ Signal ready (Algo URL not configured)")
-            state.set_trade_lock(False)
+        if call.data == "DO_DEEP":
+            if not state.get_market_ok():
+                bot.answer_callback_query(call.id, "⚠️ Market changed")
+                return
+            
+            if state.get_trade_lock():
+                bot.answer_callback_query(call.id, "⛔ Trade in progress")
+                return
+            
+            bot.answer_callback_query(call.id, "🔍 Analyzing...")
+            state.set_trade_lock(True)
+            
+            signal, reason = analyze_deep()
+            
+            if signal is None:
+                bot.send_message(USER_ID, f"⚠️ Failed:\n{reason}")
+                state.set_trade_lock(False)
+                return
+            
+            bot.send_message(USER_ID, f"📊 Result:\n{reason}\n\n👉 <b>{signal}</b>")
+            
+            if ALGO_URL:
+                send_signal_to_algo(signal)
+            else:
+                bot.send_message(USER_ID, "✅ Signal ready (Algo URL not configured)")
+                state.set_trade_lock(False)
+                
+    except Exception as e:
+        print(f"Callback error: {e}")
+        state.set_trade_lock(False)
+        try:
+            bot.answer_callback_query(call.id, "⚠️ Error occurred")
+        except:
+            pass
 
+# =============================================================
+#  SEND SIGNAL TO ALGO
+# =============================================================
 def send_signal_to_algo(signal: str) -> None:
     payload = {
         "signal": signal,
@@ -615,26 +610,28 @@ def send_signal_to_algo(signal: str) -> None:
     
     try:
         res = requests.post(ALGO_URL, json=payload, timeout=10)
-        data = res.json()
-        bot.send_message(USER_ID, f"✅ Sent to Algo")
+        if res.status_code == 200:
+            bot.send_message(USER_ID, "✅ Sent to Algo")
+        else:
+            bot.send_message(USER_ID, f"⚠️ Algo returned: {res.status_code}")
     except Exception as e:
-        bot.send_message(USER_ID, f"⚠️ Algo error: {e}")
+        bot.send_message(USER_ID, f"⚠️ Algo error: {str(e)}")
     finally:
         state.set_trade_lock(False)
 
 # =============================================================
 #  MESSAGE HANDLER
 # =============================================================
-
 @bot.message_handler(func=lambda m: True)
 def handle_message(msg) -> None:
     if msg.from_user.id != USER_ID:
         return
     
-    text = msg.text.strip().lower()
+    text = msg.text.strip().lower() if msg.text else ""
     
     if text in ["reset", "/reset"]:
         state.reset()
+        cleanup()
         bot.send_message(USER_ID, "✅ Reset")
     
     elif text in ["status", "/status"]:
@@ -647,18 +644,22 @@ def handle_message(msg) -> None:
             return
         
         bot.send_message(USER_ID, "🔍 Analyzing...")
-        ok, message = analyze_market_basic()
         
-        if ok:
-            state.set_market_ok(True)
-            bot.send_message(USER_ID, message, reply_markup=get_proceed_button())
-        else:
-            state.set_market_ok(False)
-            bot.send_message(USER_ID, message)
+        try:
+            ok, message = analyze_market_basic()
+            
+            if ok:
+                state.set_market_ok(True)
+                bot.send_message(USER_ID, message, reply_markup=get_proceed_button())
+            else:
+                state.set_market_ok(False)
+                bot.send_message(USER_ID, message)
+        except Exception as e:
+            bot.send_message(USER_ID, f"⚠️ Error: {str(e)}")
+            cleanup()
     
     elif text in ["help", "/help", "உதவி"]:
-        help_text = """
-🤖 <b>Trading Bot Commands:</b>
+        help_text = """🤖 <b>Trading Bot Commands:</b>
 
 • <b>market</b> / <b>மார்க்கெட்</b> - Check market
 • <b>status</b> - Bot status  
@@ -676,17 +677,47 @@ def handle_message(msg) -> None:
         bot.send_message(USER_ID, "❗ Type 'market' or 'help'")
 
 # =============================================================
+#  FLASK HEALTH CHECK (For Railway)
+# =============================================================
+if FLASK_AVAILABLE:
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def index():
+        return jsonify({"status": "ok", "bot": "trading-bot"})
+    
+    @app.route('/health')
+    def health():
+        return jsonify({
+            "status": "healthy",
+            "market_ok": state.get_market_ok(),
+            "trade_lock": state.get_trade_lock(),
+            "time": now_str()
+        })
+    
+    def run_flask():
+        # Run on port from env or default 8080
+        port = int(os.getenv("PORT", 8080))
+        app.run(host="0.0.0.0", port=port, debug=False)
+
+# =============================================================
 #  MAIN
 # =============================================================
-
 def start_bot() -> None:
     print("=" * 50)
-    print("🚀 TELEGRAM TRADING BOT - RAILWAY READY v8.0")
+    print("🚀 TELEGRAM TRADING BOT - RAILWAY v8.0")
     print("=" * 50)
     print(f"📱 Bot: {TOKEN[:10]}...")
     print(f"👤 User: {USER_ID}")
     print(f"⏰ Trading: 9:15 AM - 3:30 PM IST")
     print("=" * 50)
+    
+    # Start Flask health check in background
+    if FLASK_AVAILABLE:
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        print("✅ Health check endpoint ready")
+    
     print("✅ Bot running...")
     print("=" * 50)
     
@@ -694,7 +725,7 @@ def start_bot() -> None:
         try:
             bot.infinity_polling(timeout=30, long_polling_timeout=35)
         except Exception as e:
-            print(f"⚠️ Error: {e}")
+            print(f"⚠️ Polling error: {e}")
             print("🔄 Restarting in 5 seconds...")
             time.sleep(5)
             cleanup()
