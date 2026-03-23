@@ -176,16 +176,22 @@ class MockRedis:
             self._e.clear()
 
 # SAFE REDIS INITIALIZATION - WILL NEVER FAIL
+try:
+    import redis
+    REDIS_IMPORT_AVAILABLE = True
+except ImportError:
+    REDIS_IMPORT_AVAILABLE = False
+    print("⚠️ redis module not available, using MockRedis")
+
 REDIS_URL = os.environ.get("REDIS_URL")
 try:
-    if REDIS_URL:
-        import redis
+    if REDIS_URL and REDIS_IMPORT_AVAILABLE:
         _temp_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
         _temp_redis.ping()
         r = _temp_redis
         print("✅ Connected to Redis successfully")
     else:
-        print("⚠️ No REDIS_URL found, using MockRedis")
+        print("⚠️ No REDIS_URL or redis module not available, using MockRedis")
         r = MockRedis()
 except (ImportError, Exception) as e:
     print(f"⚠️ Redis connection failed: {e}. Using MockRedis fallback.")
