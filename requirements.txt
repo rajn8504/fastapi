@@ -4,6 +4,5 @@ redis==5.0.1
 pytz==2023.3
 python-dotenv==1.0.0
 requests==2.31.0
-smartapi-python==1.1.9
 pyotp==2.9.0
 typing-extensions==4.8.0
