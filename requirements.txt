@@ -6,3 +6,5 @@ pytz
 python-dotenv
 smartapi-python
 redis
+aiogram==2.25.1
+yfinance==0.2.33
