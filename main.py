@@ -332,29 +332,55 @@ async def pnl_today():
     }
 
 # ═══════════════════════════════════════════════════════════════════════
-# BACKGROUND MONITOR
+# BACKGROUND MONITOR (FIXED & SECURE)
 # ═══════════════════════════════════════════════════════════════════════
 async def background_monitor():
+    """மதியம் 2:25-க்கு மேல் ஒருமுறை மட்டுமே EOD மெசேஜ் அனுப்பும் வகையில் மேம்படுத்தப்பட்டுள்ளது"""
     while True:
         try:
-            if hhmm_now() >= 1425:  # 2:25 PM EOD
-                r.delete("ACTIVE_TRADE")
-                await send_telegram_alert("🛑 EOD AUTO-EXIT COMPLETE")
+            now = now_ist()
+            current_date = now.strftime("%Y-%m-%d")
             
-            await asyncio.sleep(30)
-        except: await asyncio.sleep(30)
+            # மதியம் 2:25 (1425) -க்கு மேல் மற்றும் மார்க்கெட் முடியும் நேரம்
+            if hhmm_now() >= 1425:
+                # இன்று ஏற்கனவே மெசேஜ் அனுப்பப்பட்டதா என்பதை ஸ்டோரேஜில் செக் செய்கிறோம்
+                already_done = r.get(f"EOD_DONE_{current_date}")
+                
+                if not already_done:
+                    # பழைய டிரேடு லாக்குகளை நீக்குகிறோம்
+                    r.delete("ACTIVE_TRADE")
+                    
+                    # டெலிகிராம் அலர்ட் - ஒரு நாளைக்கு ஒருமுறை மட்டுமே வரும்
+                    await send_telegram_alert(
+                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>\n"
+                        "இன்றைய வர்த்தகம் பாதுகாப்பாக முடிந்தது. நாளை காலை சந்திப்போம்!"
+                    )
+                    
+                    # இன்று மெசேஜ் அனுப்பிவிட்டோம் என குறித்துக் கொள்கிறோம் (24 மணிநேரத்திற்கு)
+                    r.setex(f"EOD_DONE_{current_date}", 86400, "true")
+            
+            # 60 வினாடிகள் இடைவெளியில் செக் செய்யும் (CPU சேமிப்பு)
+            await asyncio.sleep(60) 
+        except Exception as e:
+            # ஏதாவது பிழை ஏற்பட்டால் 60 வினாடி கழித்து மீண்டும் முயற்சிக்கும்
+            await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup():
+    """பாட் ஸ்டார்ட் ஆகும் போது வரும் முதல் மெசேஜ்"""
     await send_telegram_alert(
         f"🚀 <b>HFT v7.3 LIVE</b>\n"
-        f"🔒 TELEGRAM ONLY MODE\n"
         f"💰 ₹20K Safe | {SAFE_STRATEGY}\n"
-        f"🛡️ Max Loss: ₹1K/day\n"
+        f"🛡️ Fix: EOD Message Loop Resolved\n"
         f"Commands: /trade /predict /status"
     )
+    # பேக்ரவுண்ட் டாஸ்க்கை தொடங்குகிறது
     asyncio.create_task(background_monitor())
 
 if __name__ == "__main__":
+    # போர்ட் செட்டிங்ஸ் (Railway-க்கு ஏற்றவாறு)
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    
+    # "main:app" என்பதற்கு பதில் நேரடியாக app ஆப்ஜெக்ட் பயன்படுத்தப்படுகிறது
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
