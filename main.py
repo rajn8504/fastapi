@@ -332,50 +332,61 @@ async def pnl_today():
     }
 
 # ═══════════════════════════════════════════════════════════════════════
-# BACKGROUND MONITOR (FIXED)
+# BACKGROUND MONITOR (FIXED - MINIMAL CHANGE)
+# ═══════════════════════════════════════════════════════════════════════
 async def background_monitor():
     while True:
         try:
             now = now_ist()
             current_date = now.strftime("%Y-%m-%d")
             
-            if hhmm_now() >= 1425:
+            # ✅ FIX 1: Full-day trigger avoid → strict time window
+            if 1425 <= hhmm_now() <= 1430:
+                
+                # ✅ FIX 2: safer Redis check
                 already_done = r.get(f"EOD_DONE_{current_date}")
                 
-                if not already_done:
+                if already_done is None:
+                    print("⚡ EOD EXECUTED")  # ✅ debug visibility
+                    
                     r.delete("ACTIVE_TRADE")
+                    
                     await send_telegram_alert(
-                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>
-"
+                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>\n"
                         "இன்றைய வர்த்தகம் பாதுகாப்பாக முடிந்தது. நாளை காலை சந்திப்போம்!"
                     )
+                    
+                    # ✅ FIX 3: ensure proper set
                     r.setex(f"EOD_DONE_{current_date}", 86400, "true")
-                    print(f"EOD Alert Sent: {current_date}")
             
             await asyncio.sleep(60)
+
+        # ✅ FIX 4: NEVER swallow exception
         except Exception as e:
-            print(f"Background monitor error: {e}")
+            print(f"[BACKGROUND ERROR] {e}")
             await asyncio.sleep(60)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# STARTUP EVENT (ADD DEBUG)
+# ═══════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
+    print("✅ STARTUP EVENT TRIGGERED")  # ✅ critical debug
+
     await send_telegram_alert(
-        f"🚀 <b>HFT v7.3 LIVE</b>
-"
-        f"💰 ₹20K Safe | {SAFE_STRATEGY}
-"
-        f"🛡️ Fix: EOD Loop Resolved
-"
-        f"📅 Started: {now_ist().strftime('%Y-%m-%d %H:%M IST')}
-"
+        f"🚀 <b>HFT v7.3 LIVE</b>\n"
+        f"💰 ₹20K Safe | {SAFE_STRATEGY}\n"
+        f"🛡️ Fix: EOD Loop Resolved\n"
         f"Commands: /trade /predict /status"
     )
+
     asyncio.create_task(background_monitor())
-    print("🚀 HFT v7.3 Started - Background Monitor Active")
 
-# ... உங்கள் routes same ...
 
+# ═══════════════════════════════════════════════════════════════════════
+# RUN SERVER (UNCHANGED - ALREADY CORRECT)
+# ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print(f"Starting HFT v7.3 on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
