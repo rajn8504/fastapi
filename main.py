@@ -332,7 +332,7 @@ async def pnl_today():
     }
 
 # ═══════════════════════════════════════════════════════════════════════
-# BACKGROUND MONITOR (FIXED - MINIMAL CHANGE)
+# BACKGROUND MONITOR (UNCHANGED)
 # ═══════════════════════════════════════════════════════════════════════
 async def background_monitor():
     while True:
@@ -340,14 +340,12 @@ async def background_monitor():
             now = now_ist()
             current_date = now.strftime("%Y-%m-%d")
             
-            # ✅ FIX 1: Full-day trigger avoid → strict time window
             if 1425 <= hhmm_now() <= 1430:
                 
-                # ✅ FIX 2: safer Redis check
                 already_done = r.get(f"EOD_DONE_{current_date}")
                 
                 if already_done is None:
-                    print("⚡ EOD EXECUTED")  # ✅ debug visibility
+                    print("⚡ EOD EXECUTED")
                     
                     r.delete("ACTIVE_TRADE")
                     
@@ -356,36 +354,35 @@ async def background_monitor():
                         "இன்றைய வர்த்தகம் பாதுகாப்பாக முடிந்தது. நாளை காலை சந்திப்போம்!"
                     )
                     
-                    # ✅ FIX 3: ensure proper set
                     r.setex(f"EOD_DONE_{current_date}", 86400, "true")
             
             await asyncio.sleep(60)
 
-        # ✅ FIX 4: NEVER swallow exception
         except Exception as e:
             print(f"[BACKGROUND ERROR] {e}")
             await asyncio.sleep(60)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STARTUP EVENT (ADD DEBUG)
+# STARTUP EVENT (FIXED - NON BLOCKING)
 # ═══════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
-    print("✅ STARTUP EVENT TRIGGERED")  # ✅ critical debug
+    print("✅ STARTUP EVENT TRIGGERED")
 
-    await send_telegram_alert(
+    # 🔥 FIX: blocking await → background task
+    asyncio.create_task(send_telegram_alert(
         f"🚀 <b>HFT v7.3 LIVE</b>\n"
         f"💰 ₹20K Safe | {SAFE_STRATEGY}\n"
         f"🛡️ Fix: EOD Loop Resolved\n"
         f"Commands: /trade /predict /status"
-    )
+    ))
 
     asyncio.create_task(background_monitor())
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# RUN SERVER (UNCHANGED - ALREADY CORRECT)
+# RUN SERVER (UNCHANGED)
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
