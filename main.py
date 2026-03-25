@@ -333,45 +333,49 @@ async def pnl_today():
 
 # ═══════════════════════════════════════════════════════════════════════
 # BACKGROUND MONITOR (FIXED)
-# ═══════════════════════════════════════════════════════════════════════
 async def background_monitor():
     while True:
         try:
             now = now_ist()
             current_date = now.strftime("%Y-%m-%d")
             
-            # மதியம் 2:25 (1425) -க்கு மேல் 
             if hhmm_now() >= 1425:
-                # இன்று ஏற்கனவே மெசேஜ் அனுப்பப்பட்டதா என்று செக் செய்கிறோம்
                 already_done = r.get(f"EOD_DONE_{current_date}")
                 
                 if not already_done:
                     r.delete("ACTIVE_TRADE")
                     await send_telegram_alert(
-                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>\n"
+                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>
+"
                         "இன்றைய வர்த்தகம் பாதுகாப்பாக முடிந்தது. நாளை காலை சந்திப்போம்!"
                     )
-                    # இன்று மெசேஜ் அனுப்பிவிட்டோம் என குறித்துக் கொள்கிறோம் (24 மணிநேரத்திற்கு)
                     r.setex(f"EOD_DONE_{current_date}", 86400, "true")
+                    print(f"EOD Alert Sent: {current_date}")
             
-            await asyncio.sleep(60) # 1 நிமிடம் இடைவெளி
-        except: 
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"Background monitor error: {e}")
             await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup():
     await send_telegram_alert(
-        f"🚀 <b>HFT v7.3 LIVE</b>\n"
-        f"💰 ₹20K Safe | {SAFE_STRATEGY}\n"
-        f"🛡️ Fix: EOD Loop Resolved\n"
+        f"🚀 <b>HFT v7.3 LIVE</b>
+"
+        f"💰 ₹20K Safe | {SAFE_STRATEGY}
+"
+        f"🛡️ Fix: EOD Loop Resolved
+"
+        f"📅 Started: {now_ist().strftime('%Y-%m-%d %H:%M IST')}
+"
         f"Commands: /trade /predict /status"
     )
     asyncio.create_task(background_monitor())
+    print("🚀 HFT v7.3 Started - Background Monitor Active")
 
-# ═══════════════════════════════════════════════════════════════════════
-# RUN SERVER (CORRECTED FORMAT)
-# ═══════════════════════════════════════════════════════════════════════
+# ... உங்கள் routes same ...
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    # முக்கியமான மாற்றம்: app-க்கு பதில் "main:app" என்று String ஆக மாற்றப்பட்டுள்ளது
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
+    print(f"Starting HFT v7.3 on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", reload=False)
