@@ -398,7 +398,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(
@@ -410,28 +409,41 @@ logging.basicConfig(
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def _get_env(*names: str, default: str = "") -> str:
+    """Try multiple env var names in order — whichever is set first wins."""
+    for name in names:
+        val = os.getenv(name, "").strip()
+        if val:
+            return val
+    return default
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 class Cfg:
-    API_KEY          = os.getenv("API_KEY", "")
-    CLIENT_ID        = os.getenv("CLIENT_ID", "")
-    PASSWORD         = os.getenv("PASSWORD", "")
-    TOTP_SECRET      = os.getenv("TOTP_SECRET", "")
+    # Angel One — accepts both short and long env var names
+    API_KEY     = _get_env("API_KEY",     "ANGEL_API_KEY")
+    CLIENT_ID   = _get_env("CLIENT_ID",   "ANGEL_CLIENT_ID")
+    PASSWORD    = _get_env("PASSWORD",    "ANGEL_PASSWORD",   "ANGEL_PIN")
+    TOTP_SECRET = _get_env("TOTP_SECRET", "ANGEL_TOTP_SECRET","TOTP_STR")
 
-    TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    # Telegram — accepts any common naming convention
+    TELEGRAM_TOKEN   = _get_env("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN",
+                                "BOT_TOKEN",       "TG_TOKEN")
+    TELEGRAM_CHAT_ID = _get_env("TELEGRAM_CHAT_ID", "TG_CHAT_ID",
+                                "CHAT_ID")
 
-    CAPITAL          = float(os.getenv("CAPITAL",        "20000"))
-    MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "1000"))
-    DAILY_TARGET     = float(os.getenv("DAILY_TARGET",   "1500"))
-    LOT_SIZE         = int(os.getenv("LOT_SIZE",         "1"))
+    CAPITAL        = float(_get_env("CAPITAL",        default="20000"))
+    MAX_DAILY_LOSS = float(_get_env("MAX_DAILY_LOSS", default="1000"))
+    DAILY_TARGET   = float(_get_env("DAILY_TARGET",   default="1500"))
+    LOT_SIZE       = int(_get_env("LOT_SIZE",         default="1"))
 
-    UNDERLYING       = os.getenv("UNDERLYING",  "BANKNIFTY")
-    TRADE_MODE       = os.getenv("TRADE_MODE",  "paper").lower()
-    STATE_FILE       = Path(os.getenv("STATE_FILE", "db.json"))
+    UNDERLYING  = _get_env("UNDERLYING",  default="BANKNIFTY")
+    TRADE_MODE  = _get_env("TRADE_MODE",  default="paper").lower()
+    STATE_FILE  = Path(_get_env("STATE_FILE", default="db.json"))
 
-    TRADE_START      = int(os.getenv("TRADE_START", "930"))
-    TRADE_END        = int(os.getenv("TRADE_END",   "1430"))
+    TRADE_START = int(_get_env("TRADE_START", default="930"))
+    TRADE_END   = int(_get_env("TRADE_END",   default="1430"))
 
 
 def _hhmm() -> int:
@@ -1125,17 +1137,33 @@ class TradingEngine:
         except ValueError:
             await update.message.reply_text("Invalid value.")
 
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """First command — verifies bot is alive and receiving messages."""
+        user = update.effective_user
+        name = user.first_name if user else "Trader"
+        await update.message.reply_text(
+            f"👋 *வணக்கம் {name}!*\n\n"
+            f"🤖 Ultra-Fast Algo Bot இயங்குகிறது!\n\n"
+            f"Mode: `{Cfg.TRADE_MODE.upper()}`\n"
+            f"Underlying: `{Cfg.UNDERLYING}`\n"
+            f"Capital: ₹{Cfg.CAPITAL:,.0f}\n\n"
+            f"Commands பார்க்க /help அனுப்பவும்\n"
+            f"Trade தொடங்க /starttrade அனுப்பவும்",
+            parse_mode="Markdown",
+        )
+
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "🤖 *Ultra-Fast Algo Bot Commands*\n\n"
+            "/start — Bot live என்று confirm செய்\n"
             "/status — Balance, P&L, Market Health\n"
-            "/checkstrategy — Analyze current setup\n"
-            "/starttrade — Start Paper or Real trade\n"
-            "/stop — Disarm (no new entries)\n"
-            "/exitnow — Force exit active trade\n"
-            "/setvix <val> — Set VIX manually\n"
-            "/setad <val> — Set Advance-Decline ratio\n"
-            "/help — Show this message",
+            "/checkstrategy — Current setup analyze\n"
+            "/starttrade — Paper அல்லது Real trade தொடங்கு\n"
+            "/stop — Bot disarm (new trades இல்லை)\n"
+            "/exitnow — Active trade force exit\n"
+            "/setvix <val> — VIX manually set\n"
+            "/setad <val> — Advance-Decline ratio set\n"
+            "/help — இந்த list காட்டு",
             parse_mode="Markdown",
         )
 
@@ -1145,10 +1173,19 @@ class TradingEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_app(engine: TradingEngine) -> Optional[Application]:
-    if not Cfg.TELEGRAM_TOKEN:
-        logger.warning("No TELEGRAM_TOKEN — Telegram commands disabled")
+    """Build Telegram Application with all command handlers registered."""
+    token = Cfg.TELEGRAM_TOKEN
+    if not token:
+        logger.warning(
+            "❌ No Telegram token found! Checked env vars: "
+            "TELEGRAM_TOKEN, TELEGRAM_BOT_TOKEN, BOT_TOKEN, TG_TOKEN"
+        )
         return None
-    app = Application.builder().token(Cfg.TELEGRAM_TOKEN).build()
+
+    logger.info("✅ Telegram token found (len=%d) — building app...", len(token))
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start",         engine.cmd_start))
     app.add_handler(CommandHandler("status",        engine.cmd_status))
     app.add_handler(CommandHandler("checkstrategy", engine.cmd_checkstrategy))
     app.add_handler(CommandHandler("starttrade",    engine.cmd_starttrade))
@@ -1162,16 +1199,36 @@ def build_app(engine: TradingEngine) -> Optional[Application]:
 
 
 async def _async_main() -> None:
-    engine = TradingEngine()
-    await engine.start()
+    # ── 1. Print startup env info ─────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("ULTRA-FAST ALGO BOT STARTING")
+    logger.info("TRADE_MODE  : %s", Cfg.TRADE_MODE)
+    logger.info("UNDERLYING  : %s", Cfg.UNDERLYING)
+    logger.info("API_KEY set : %s", bool(Cfg.API_KEY))
+    logger.info("TG token set: %s (len=%d)", bool(Cfg.TELEGRAM_TOKEN), len(Cfg.TELEGRAM_TOKEN))
+    logger.info("TG chat_id  : %s", Cfg.TELEGRAM_CHAT_ID or "NOT SET")
+    logger.info("=" * 60)
 
+    # ── 2. Build Telegram app FIRST ───────────────────────────────────────────
+    engine = TradingEngine()
     tg_app = build_app(engine)
+
     if tg_app:
+        logger.info("Initialising Telegram application...")
         await tg_app.initialize()
         await tg_app.start()
-        await tg_app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Telegram polling started ✅")
+        await tg_app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        logger.info("✅ Telegram polling ACTIVE — send /start to your bot now")
+    else:
+        logger.warning("⚠️  Telegram disabled — bot will run silently")
 
+    # ── 3. Start trading engine ───────────────────────────────────────────────
+    await engine.start()
+
+    # ── 4. Keep alive ─────────────────────────────────────────────────────────
     try:
         while True:
             await asyncio.sleep(1)
@@ -1180,6 +1237,7 @@ async def _async_main() -> None:
     finally:
         engine._running = False
         if tg_app:
+            logger.info("Stopping Telegram...")
             await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()
@@ -1192,6 +1250,7 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     def _shutdown():
+        logger.info("Shutdown signal received")
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
@@ -1199,7 +1258,7 @@ def main() -> None:
         try:
             loop.add_signal_handler(sig, _shutdown)
         except NotImplementedError:
-            pass   # Windows
+            pass  # Windows doesn't support add_signal_handler
 
     try:
         loop.run_until_complete(_async_main())
