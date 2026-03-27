@@ -1,4 +1,4 @@
-SmartApi>=1.1.9
+SmartApi==1.1.0
 python-telegram-bot>=20.0
 pyotp>=2.8.0
 httpx>=0.24.0
