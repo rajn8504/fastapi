@@ -1,10 +1,5 @@
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-slowapi==0.1.9
-httpx==0.27.2
-orjson==3.10.7
-pytz==2024.2
-numpy>=2.1.0
-smartapi-python==1.4.1
-pyotp==2.9.0
-python-dotenv==1.0.1
+SmartApi>=1.1.9
+python-telegram-bot>=20.0
+pyotp>=2.8.0
+httpx>=0.24.0
+websocket-client>=1.6.0
