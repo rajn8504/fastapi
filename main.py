@@ -718,6 +718,15 @@ class TradingEngine:
         self._ad_ratio = 1.0
         self._last_pct_notify: Dict[str, float] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Simulation state
+        self._sim_price  = 55000.0    # BankNifty base price
+        self._sim_volume = 0
+        self._sim_candle_count = 0
+
+    @property
+    def _demo_mode(self) -> bool:
+        """True when running paper mode without Angel One credentials."""
+        return not bool(Cfg.API_KEY)
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -760,8 +769,126 @@ class TradingEngine:
                 f"`{t.symbol}` Entry=₹{t.entry_price:.2f} SL=₹{t.sl_price:.2f}"
             )
 
-        asyncio.create_task(self._ws_loop())
         asyncio.create_task(self._maintenance_loop())
+
+        # Start simulation loop when no API key (demo mode)
+        if self._demo_mode:
+            asyncio.create_task(self._simulation_loop())
+            await self.tg.send(
+                "🎮 *Demo Simulation Mode Active*\n"
+                "API Key இல்லாமல் Bot-ஐ test செய்யலாம்!\n\n"
+                "• Realistic BankNifty price ticks generate ஆகும்\n"
+                "• 6-8 நிமிடத்தில் signal வரும்\n"
+                "• /starttrade → Paper Trade → signal காத்திருங்கள்\n\n"
+                "_Real trading-க்கு Angel One API Key தேவை_"
+            )
+
+    # ── Demo Simulation Loop ──────────────────────────────────────────────────
+
+    async def _simulation_loop(self) -> None:
+        """
+        Generates realistic BankNifty tick data when running without API credentials.
+        Each tick fires every 3 seconds. Candles close every 30 seconds (fast-mode).
+        A signal should appear within 6-8 minutes.
+        """
+        import random
+        rng         = random.Random(42)
+        spot_token  = SPOT_TOKEN.get(Cfg.UNDERLYING, "26009")
+        tick_count  = 0
+        # Candle period: 30 real seconds = simulated 5-min bar (for fast demo)
+        CANDLE_TICKS = 10   # 10 ticks × 3s = 30s per candle
+        base_vol     = 50000
+
+        logger.info("🎮 Simulation loop started — tick every 3s, candle every 30s")
+
+        # Force-set the candle second so IndicatorEngine builds candles on our schedule
+        candle_ts = time.time()
+
+        while self._running:
+            await asyncio.sleep(3)
+            if not self._trade_armed and not self.state.active_trade:
+                # Bot not armed yet — still generate ticks for indicator warm-up
+                pass
+
+            tick_count += 1
+
+            # ── Price simulation (random walk with trend bias) ─────────────────
+            # After 8 candles, add a bullish trend to likely trigger CALL signal
+            candle_num = tick_count // CANDLE_TICKS
+            if candle_num < 4:
+                drift = rng.uniform(-0.0015, 0.0015)   # flat / choppy
+            elif candle_num < 8:
+                drift = rng.uniform(-0.0005, 0.002)    # mild uptrend
+            else:
+                drift = rng.uniform(0.001, 0.003)      # strong trend → RSI rises
+
+            self._sim_price = round(self._sim_price * (1 + drift), 2)
+            self._sim_price = max(40000.0, min(70000.0, self._sim_price))
+
+            # ── Volume simulation (spike every ~10 candles) ────────────────────
+            self._sim_volume += rng.randint(800, 2000)
+            # Inject a volume spike when we're in strong trend phase
+            if candle_num >= 10 and (tick_count % CANDLE_TICKS) == 5:
+                self._sim_volume += base_vol * 3   # 3× average spike
+
+            # ── Build the tick using fake 5-min candle boundaries ─────────────
+            # Map real elapsed seconds → fake 5-min epoch so IndicatorEngine
+            # sees proper candle boundaries
+            fake_ts_sec = candle_ts + (tick_count * 300 / CANDLE_TICKS)
+            ts_ms       = int(fake_ts_sec * 1000)
+
+            tick = Tick(
+                token=spot_token,
+                ltp=self._sim_price,
+                volume=self._sim_volume,
+                timestamp_ms=ts_ms,
+            )
+
+            t_start = time.monotonic()
+            await self._process_tick_demo(tick, t_start)
+
+            # ── Status update every 12 ticks (one simulated candle) ────────────
+            if tick_count % CANDLE_TICKS == 0:
+                self._sim_candle_count += 1
+                ind = self.indicators.get(spot_token)
+                rsi_val = ind.rsi if ind else 50.0
+                logger.info(
+                    "📊 Demo candle #%d | Price=%.0f RSI=%.1f ST=%s",
+                    self._sim_candle_count,
+                    self._sim_price,
+                    rsi_val,
+                    ind.supertrend_direction if ind else "?",
+                )
+
+    async def _process_tick_demo(self, tick: Tick, t_start: float) -> None:
+        """Like _process_tick but bypasses market-hours check for simulation."""
+        token      = tick.token
+        ltp        = tick.ltp
+        spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+
+        self._spot_ltp[Cfg.UNDERLYING] = ltp
+
+        # Track option price for active demo trade
+        if self.state.active_trade and token == self.state.active_trade.token:
+            self._option_ltp[token] = ltp
+            await self._manage_trailing(ltp)
+
+        if self.state.day_blocked():
+            return
+        if self.state.active_trade or not self._trade_armed:
+            return    # Armed but already in trade, or not armed
+
+        if token not in self.indicators:
+            self.indicators[token] = IndicatorEngine()
+        ind = self.indicators[token]
+        ind.on_tick(tick)
+
+        result = self.strategy.evaluate(ltp, ind, float(tick.volume))
+        if result.signal in ("CALL", "PUT"):
+            elapsed = (time.monotonic() - t_start) * 1000
+            logger.info("🎯 DEMO %s | RSI=%.1f | ST=%s | eval=%.1fms",
+                        result.signal, result.rsi, result.supertrend_dir, elapsed)
+            await self._fire_order(result, ltp)
 
     # ── WebSocket with exponential backoff ────────────────────────────────────
 
@@ -877,7 +1004,10 @@ class TradingEngine:
 
         if token != spot_token:
             return
-        if not _is_trading_hours() or self.state.day_blocked():
+        # Skip market hours check in demo mode (simulation bypasses via _process_tick_demo)
+        if not self._demo_mode and (not _is_trading_hours() or self.state.day_blocked()):
+            return
+        if self.state.day_blocked():
             return
         if self.state.active_trade or not self._trade_armed:
             return
