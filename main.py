@@ -1,1050 +1,833 @@
 """
-HFT v8.0 - ULTIMATE HYBRID (Full Features)
-═══════════════════════════════════════════════════════════════════════
-✅ Angel One Real API + Paper Trade Mode
-✅ 3 Safe Strategies (BANKNIFTY PUT / IRON CONDOR / FINNIFTY)
-✅ AI Strategy Predictor
-✅ Trailing Stop Loss (Real-time Monitor)
-✅ Paper Mode / Real Mode (Telegram switch)
-✅ Auto Self-Heal via /fix command
-✅ Single Trade Lock (30 min)
-✅ EOD Auto Exit
-✅ Kill Switch
-✅ Telegram Only Mode
-✅ Complete Error Handling
-═══════════════════════════════════════════════════════════════════════
-Max Loss : ₹750/trade | ₹1000/day
-Capital  : ₹20,000
-Overnight: ZERO
-═══════════════════════════════════════════════════════════════════════
+Ultra-Fast HFT Trading Bot — Angel One SmartAPI
+Async | WebSocket | Telegram UI | Railway.app Ready
 """
 
-# ─────────────────────────────────────────────────────────────────────
-# IMPORTS
-# ─────────────────────────────────────────────────────────────────────
 import asyncio
-import time
-import datetime
-import threading
-import orjson
-import os
-import httpx
-import hmac
-import hashlib
-import uvicorn
-import pytz
-import traceback
+import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from contextlib import asynccontextmanager
+import os
+import signal
+import sys
+import time
+from datetime import datetime, date
+from typing import Optional
 
-# FastAPI imports
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+import pyotp
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from strategies import AlphaStrategy
+from state_manager import StateManager
+from risk_manager import RiskManager
 
-# ─────────────────────────────────────────────────────────────────────
-# APP INIT
-# ─────────────────────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address)
+# ─────────────────────────────────────────────
+# Logging Setup
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("TradingBot")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan manager for startup/shutdown events"""
-    # Startup
-    logger.info("✅ HFT v8.0 STARTING UP...")
-    
-    # Default mode: PAPER (safe startup)
-    if not r.get("TRADE_MODE"):
-        set_trade_mode("PAPER")
-    
-    # Send startup message
-    asyncio.create_task(send_telegram(
-        f"🚀 <b>HFT v8.0 ULTIMATE LIVE</b>\n"
-        f"{'─'*30}\n"
-        f"💰 Capital: ₹20,000\n"
-        f"📋 Mode: <b>{get_trade_mode()}</b>\n"
-        f"📊 Strategy: {SAFE_STRATEGY}\n"
-        f"🛡️ Trailing SL: ON (₹{TRAIL_TRIGGER_PROFIT} trigger)\n"
-        f"🤖 AI Predictor: {'ON' if AI_PREDICT else 'OFF'}\n"
-        f"🔧 Auto-fix: /fix\n"
-        f"{'─'*30}\n"
-        f"Commands:\n"
-        f"/trade /put /condor /finnifty\n"
-        f"/paper /real /mode\n"
-        f"/fix /kill /resume /status"
-    ))
-    
-    # Start background tasks
-    asyncio.create_task(background_monitor())
-    asyncio.create_task(trailing_sl_monitor())
-    asyncio.create_task(health_check_monitor())
-    
-    yield
-    
-    # Shutdown
-    logger.info("🛑 HFT v8.0 SHUTTING DOWN...")
-    await send_telegram("🛑 <b>HFT v8.0 SHUTDOWN</b> - System stopping")
 
-app = FastAPI(title="HFT v8.0 - Ultimate Hybrid", lifespan=lifespan)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# ─────────────────────────────────────────────
+# Config from Environment
+# ─────────────────────────────────────────────
+class Config:
+    API_KEY: str = os.environ["ANGEL_API_KEY"]
+    CLIENT_ID: str = os.environ["ANGEL_CLIENT_ID"]
+    PASSWORD: str = os.environ["ANGEL_PASSWORD"]
+    TOTP_SECRET: str = os.environ["ANGEL_TOTP_SECRET"]
+    TELEGRAM_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+    TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
 
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 1 — CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════
-TELEGRAM_ONLY    = os.getenv("TELEGRAM_ONLY", "true").lower() == "true"
-SAFE_MODE        = os.getenv("SAFE_MODE", "true").lower() == "true"
-MICRO_20K        = os.getenv("MICRO_20K", "true").lower() == "true"
-AI_PREDICT       = os.getenv("AI_PREDICT", "true").lower() == "true"
-SAFE_STRATEGY    = os.getenv("SAFE_STRATEGY", "BANKNIFTY_PUT").upper()
+    CAPITAL: float = float(os.getenv("CAPITAL", "20000"))
+    MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "1000"))
+    DAILY_TARGET: float = float(os.getenv("DAILY_TARGET", "1500"))
+    TRADE_MODE: str = os.getenv("TRADE_MODE", "paper")  # 'paper' | 'live'
 
-WEBHOOK_SECRET      = os.getenv("HMAC_SECRET", "your_secret_change_me")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+    BREAKEVEN_TRIGGER: float = float(os.getenv("BREAKEVEN_TRIGGER", "300"))
+    TRAIL_TRIGGER: float = float(os.getenv("TRAIL_TRIGGER", "700"))
+    TRAIL_STEP: float = float(os.getenv("TRAIL_STEP", "100"))
 
-# Angel One credentials
-ANGEL_API_KEY       = os.getenv("ANGEL_API_KEY", "")
-ANGEL_CLIENT_ID     = os.getenv("ANGEL_CLIENT_ID", "")
-ANGEL_PASSWORD      = os.getenv("ANGEL_PASSWORD", "")
-ANGEL_TOTP_SECRET   = os.getenv("ANGEL_TOTP_SECRET", "")
+    WS_RECONNECT_BASE: float = 1.0
+    WS_RECONNECT_MAX: float = 60.0
 
-LOT_SIZES = {
-    "BANKNIFTY": 15,
-    "NIFTY":     25,
-    "FINNIFTY":  40,
-}
-LOT_SIZE = LOT_SIZES.get(SAFE_STRATEGY.split("_")[0], 15)
 
-# Risk limits
-DAILY_MAX_LOSS     = -1000
-PER_TRADE_MAX_LOSS = -750
-DAILY_MAX_TRADES   = 3
-MAX_CONCURRENT_TRADES = 1
-TRADE_INTERVAL     = 1800
+# ─────────────────────────────────────────────
+# Angel One Connector
+# ─────────────────────────────────────────────
+class AngelOneConnector:
+    def __init__(self, config: Config):
+        self.config = config
+        self.smart_api: Optional[SmartConnect] = None
+        self.auth_token: Optional[str] = None
+        self.feed_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
 
-# Trailing Stop Loss settings
-TRAIL_TRIGGER_PROFIT = 200
-TRAIL_LOCK_PERCENT   = 0.50
-TRAIL_CHECK_INTERVAL = 30
-
-IST = pytz.timezone("Asia/Kolkata")
-
-def now_ist():
-    return datetime.datetime.now(IST)
-
-def hhmm_now():
-    n = now_ist()
-    return n.hour * 100 + n.minute
-
-def is_trading_time():
-    return 930 <= hhmm_now() <= 1425
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 2 — ULTRA REDIS (Complete Implementation)
-# ═══════════════════════════════════════════════════════════════════════
-class UltraRedis:
-    def __init__(self):
-        self._store = {}
-        self._hstore = {}
-        self._lock = threading.Lock()
-
-    def get(self, key: str) -> Optional[str]:
-        with self._lock:
-            if key in self._store:
-                val, expiry = self._store[key]
-                if time.time() < expiry:
-                    return val
-                del self._store[key]
-            return None
-
-    def setex(self, key: str, ex: int, value) -> None:
-        with self._lock:
-            self._store[key] = (str(value), time.time() + ex)
-
-    def set(self, key: str, value) -> None:
-        with self._lock:
-            self._store[key] = (str(value), time.time() + 86400 * 365)
-
-    def delete(self, *keys) -> None:
-        with self._lock:
-            for key in keys:
-                self._store.pop(key, None)
-                self._hstore.pop(key, None)
-
-    def keys(self, pattern: str) -> List[str]:
-        with self._lock:
-            valid_simple = [k for k, (_, exp) in self._store.items() if time.time() < exp]
-            all_keys = list(set(valid_simple + list(self._hstore.keys())))
-            
-            if pattern.endswith("*"):
-                prefix = pattern[:-1]
-                return [k for k in all_keys if k.startswith(prefix)]
-            elif pattern.startswith("*"):
-                suffix = pattern[1:]
-                return [k for k in all_keys if k.endswith(suffix)]
-            else:
-                return [k for k in all_keys if pattern in k]
-
-    def hset(self, key: str, mapping: dict) -> None:
-        with self._lock:
-            if key not in self._hstore:
-                self._hstore[key] = {}
-            self._hstore[key].update({k: str(v) for k, v in mapping.items()})
-
-    def hget(self, key: str, field: str) -> Optional[str]:
-        with self._lock:
-            return self._hstore.get(key, {}).get(field)
-
-    def hgetall(self, key: str) -> dict:
-        with self._lock:
-            return dict(self._hstore.get(key, {}))
-
-    def hdel(self, key: str, field: str) -> None:
-        with self._lock:
-            if key in self._hstore:
-                self._hstore[key].pop(field, None)
-
-r = UltraRedis()
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 3 — GLOBAL STATE
-# ═══════════════════════════════════════════════════════════════════════
-KILL_SWITCH = False
-
-def get_trade_mode() -> str:
-    mode = r.get("TRADE_MODE")
-    return mode if mode else "PAPER"
-
-def set_trade_mode(mode: str) -> None:
-    r.set("TRADE_MODE", mode.upper())
-
-_trailing_trades: Dict[str, dict] = {}
-_trailing_lock = threading.Lock()
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 4 — ANGEL ONE API (Complete)
-# ═══════════════════════════════════════════════════════════════════════
-class AngelOneAPI:
-    def __init__(self):
-        self._token: Optional[str] = None
-        self._token_expiry: float = 0.0
-        self._session_lock = asyncio.Lock()
-
-    @property
-    def is_real(self) -> bool:
-        return bool(ANGEL_API_KEY and ANGEL_CLIENT_ID and ANGEL_PASSWORD)
-
-    async def _get_token(self) -> Optional[str]:
-        if not self.is_real:
-            return None
-        if self._token and time.time() < self._token_expiry:
-            return self._token
-
-        async with self._session_lock:
-            try:
-                totp = ""
-                if ANGEL_TOTP_SECRET:
-                    try:
-                        import pyotp
-                        totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
-                    except ImportError:
-                        logger.warning("pyotp not installed, skipping TOTP")
-                    except Exception as e:
-                        logger.error(f"TOTP error: {e}")
-
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(
-                        "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-ClientCode": ANGEL_CLIENT_ID,
-                            "X-PrivateKey": ANGEL_API_KEY,
-                        },
-                        json={
-                            "clientcode": ANGEL_CLIENT_ID,
-                            "password": ANGEL_PASSWORD,
-                            "totp": totp,
-                        },
-                    )
-                    data = resp.json()
-                    if data.get("status"):
-                        self._token = data["data"]["jwtToken"]
-                        self._token_expiry = time.time() + 3600
-                        return self._token
-                    else:
-                        logger.error(f"Angel login failed: {data}")
-                        return None
-            except Exception as e:
-                logger.error(f"Angel login error: {e}")
-                return None
-
-    async def ltp_batch(self, exchange: str, tokens: List[str]) -> dict:
-        if not self.is_real or get_trade_mode() == "PAPER":
-            mock_map = {
-                "BANKNIFTY_PUT": 100.0,
-                "IRON_CONDOR": 150.0,
-                "FINNIFTY": 25.0,
-            }
-            ltp = mock_map.get(SAFE_STRATEGY, 100.0)
-            return {"data": [{"ltp": ltp, "token": t} for t in tokens]}
-
-        jwt = await self._get_token()
-        if not jwt:
-            return {"data": [{"ltp": 100.0}] * len(tokens)}
-
+    def login(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(
-                    "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "X-PrivateKey": ANGEL_API_KEY,
-                        "X-ClientCode": ANGEL_CLIENT_ID,
-                        "Content-Type": "application/json",
-                    },
-                    json={"mode": "LTP", "exchangeTokens": {exchange: tokens}},
-                )
-                return resp.json()
-        except Exception as e:
-            logger.error(f"LTP fetch error: {e}")
-            return {"data": [{"ltp": 100.0}] * len(tokens)}
-
-    async def place_order(self, params: dict) -> dict:
-        if get_trade_mode() == "PAPER" or not self.is_real:
-            return {
-                "status": "success",
-                "orderid": f"PAPER_{int(time.time()*1000)}",
-                "mode": "PAPER",
-            }
-
-        jwt = await self._get_token()
-        if not jwt:
-            raise Exception("Angel One auth failed")
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "X-PrivateKey": ANGEL_API_KEY,
-                        "X-ClientCode": ANGEL_CLIENT_ID,
-                        "Content-Type": "application/json",
-                    },
-                    json=params,
-                )
-                return resp.json()
-        except Exception as e:
-            raise Exception(f"Place order failed: {e}")
-
-    async def exit_order(self, order_id: str, params: dict) -> dict:
-        if get_trade_mode() == "PAPER" or not self.is_real:
-            return {
-                "status": "success",
-                "orderid": f"PAPER_EXIT_{int(time.time()*1000)}",
-            }
-
-        jwt = await self._get_token()
-        if not jwt:
-            return {"status": "error", "message": "auth failed"}
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/modifyOrder",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "X-PrivateKey": ANGEL_API_KEY,
-                        "X-ClientCode": ANGEL_CLIENT_ID,
-                        "Content-Type": "application/json",
-                    },
-                    json={**params, "orderid": order_id},
-                )
-                return resp.json()
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-angel = AngelOneAPI()
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 5 — TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════
-async def send_telegram(message: str) -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        logger.info(f"📱 TELEGRAM | {message[:120]}")
-        return
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                },
-                timeout=5.0,
+            totp = pyotp.TOTP(self.config.TOTP_SECRET).now()
+            self.smart_api = SmartConnect(api_key=self.config.API_KEY)
+            session = self.smart_api.generateSession(
+                self.config.CLIENT_ID, self.config.PASSWORD, totp
             )
-    except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 6 — AI STRATEGY PREDICTOR
-# ═══════════════════════════════════════════════════════════════════════
-async def predict_best_strategy(data: Dict) -> Tuple[str, int]:
-    vix = data.get("vix", 15)
-    time_hhmm = hhmm_now()
-    volume_ratio = data.get("volume_ratio", 1)
-
-    scores = {
-        "BANKNIFTY_PUT": 50,
-        "IRON_CONDOR": 50,
-        "FINNIFTY": 50,
-    }
-
-    if 12 <= vix <= 18:
-        scores["BANKNIFTY_PUT"] += 45
-
-    if vix < 15 and time_hhmm > 1030:
-        scores["IRON_CONDOR"] += 42
-
-    if time_hhmm < 1030 and volume_ratio > 1.5:
-        scores["FINNIFTY"] += 38
-
-    best = max(scores, key=scores.get)
-    return best, scores[best]
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 7 — TRAILING STOP LOSS ENGINE (Complete)
-# ═══════════════════════════════════════════════════════════════════════
-async def register_trailing_sl(
-    order_id: str,
-    token: str,
-    entry_ltp: float,
-    lots: int,
-    lot_size: int,
-    exchange: str = "NFO",
-) -> None:
-    with _trailing_lock:
-        _trailing_trades[order_id] = {
-            "token": token,
-            "exchange": exchange,
-            "entry_ltp": entry_ltp,
-            "peak_profit": 0.0,
-            "sl_level": abs(PER_TRADE_MAX_LOSS),
-            "lots": lots,
-            "lot_size": lot_size,
-            "active": True,
-        }
-    logger.info(f"Trailing SL registered for {order_id}")
-
-async def trailing_sl_monitor() -> None:
-    """Background monitor for trailing stop loss"""
-    while True:
-        try:
-            await asyncio.sleep(TRAIL_CHECK_INTERVAL)
-
-            with _trailing_lock:
-                active_ids = [oid for oid, t in _trailing_trades.items() if t["active"]]
-
-            for order_id in active_ids:
-                try:
-                    with _trailing_lock:
-                        if order_id not in _trailing_trades:
-                            continue
-                        trade = dict(_trailing_trades[order_id])
-
-                    if not trade.get("active"):
-                        continue
-
-                    ltp_resp = await angel.ltp_batch(trade["exchange"], [trade["token"]])
-                    ltp_data = ltp_resp.get("data", [])
-                    current_ltp = float(ltp_data[0].get("ltp", trade["entry_ltp"])) if ltp_data else trade["entry_ltp"]
-
-                    entry_ltp = trade["entry_ltp"]
-                    lots = trade["lots"]
-                    lot_size = trade["lot_size"]
-
-                    pnl = (entry_ltp - current_ltp) * lot_size * lots
-
-                    with _trailing_lock:
-                        if order_id not in _trailing_trades:
-                            continue
-
-                        if pnl > _trailing_trades[order_id]["peak_profit"]:
-                            _trailing_trades[order_id]["peak_profit"] = pnl
-
-                            if pnl >= TRAIL_TRIGGER_PROFIT:
-                                new_sl = pnl * TRAIL_LOCK_PERCENT
-                                if new_sl > _trailing_trades[order_id]["sl_level"]:
-                                    _trailing_trades[order_id]["sl_level"] = new_sl
-                                    await send_telegram(
-                                        f"📈 <b>TRAILING SL UPDATED</b>\n"
-                                        f"🔖 Order: {order_id}\n"
-                                        f"💹 Peak P&L: ₹{round(pnl, 0)}\n"
-                                        f"🛡️ SL locks ₹{round(new_sl, 0)}\n"
-                                        f"📍 LTP: ₹{current_ltp}"
-                                    )
-
-                        peak_profit = _trailing_trades[order_id]["peak_profit"]
-                        sl_level = _trailing_trades[order_id]["sl_level"]
-
-                    sl_triggered = False
-                    sl_reason = ""
-
-                    if pnl <= -abs(PER_TRADE_MAX_LOSS):
-                        sl_triggered = True
-                        sl_reason = f"Max loss ₹{abs(PER_TRADE_MAX_LOSS)} hit"
-
-                    if peak_profit >= TRAIL_TRIGGER_PROFIT and pnl < sl_level:
-                        sl_triggered = True
-                        sl_reason = f"Trail SL hit (peak ₹{round(peak_profit,0)} → now ₹{round(pnl,0)})"
-
-                    if sl_triggered:
-                        with _trailing_lock:
-                            if order_id in _trailing_trades:
-                                _trailing_trades[order_id]["active"] = False
-
-                        await angel.exit_order(order_id, {
-                            "variety": "NORMAL",
-                            "transactiontype": "BUY",
-                            "ordertype": "MARKET",
-                            "producttype": "INTRADAY",
-                        })
-
-                        r.delete("ACTIVE_TRADE")
-
-                        await send_telegram(
-                            f"🛑 <b>STOP LOSS TRIGGERED</b>\n"
-                            f"📋 Order: {order_id}\n"
-                            f"⚠️ Reason: {sl_reason}\n"
-                            f"💸 Final P&L: ₹{round(pnl, 0)}\n"
-                            f"🔓 Next trade: 30 min பிறகு"
-                        )
-
-                except Exception as e:
-                    logger.error(f"Trailing SL error for {order_id}: {e}")
-
+            if session["status"]:
+                self.auth_token = session["data"]["jwtToken"]
+                self.feed_token = self.smart_api.getfeedToken()
+                self.refresh_token = session["data"]["refreshToken"]
+                logger.info("✅ Angel One login successful")
+                return True
+            logger.error(f"Login failed: {session}")
+            return False
         except Exception as e:
-            logger.error(f"Trailing monitor error: {e}")
-            await asyncio.sleep(60)
+            logger.exception(f"Login error: {e}")
+            return False
 
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 8 — SECURITY VALIDATION
-# ═══════════════════════════════════════════════════════════════════════
-def validate_hmac(body: bytes) -> dict:
-    try:
-        data = orjson.loads(body)
-    except Exception:
-        raise HTTPException(400, "INVALID_JSON")
-
-    received_sig = data.get("signature", "")
-
-    data_for_hmac = {k: v for k, v in data.items() if k != "signature"}
-
-    expected_sig = hmac.new(
-        WEBHOOK_SECRET.encode(),
-        orjson.dumps(data_for_hmac, option=orjson.OPT_SORT_KEYS),
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(received_sig, expected_sig):
-        raise HTTPException(401, "INVALID_HMAC")
-
-    return data
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 9 — SAFE TRADING ENGINE (Complete)
-# ═══════════════════════════════════════════════════════════════════════
-async def safe_hft_order(token: str, lots: int = 1) -> Dict:
-    global KILL_SWITCH
-
-    start_ms = time.time() * 1000
-
-    if KILL_SWITCH:
-        return {"status": "KILL_ACTIVE"}
-
-    if not is_trading_time():
-        return {"status": "MARKET_CLOSED"}
-
-    if r.get("ACTIVE_TRADE"):
-        return {"status": "TRADE_BUSY", "wait": "30min"}
-
-    today_prefix = f"trade:{now_ist().strftime('%Y-%m-%d')}"
-    daily_trades = len(r.keys(f"{today_prefix}:*"))
-    if daily_trades >= DAILY_MAX_TRADES:
-        return {"status": "DAILY_LIMIT", "trades_done": daily_trades}
-
-    trade_keys = r.keys(f"{today_prefix}:*")
-    daily_pnl = 0
-    for k in trade_keys:
-        profit_val = r.hget(k, "profit")
-        if profit_val:
-            daily_pnl += float(profit_val)
-    
-    if daily_pnl <= DAILY_MAX_LOSS:
-        await send_telegram(
-            f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
-            f"💸 Today P&L: ₹{round(daily_pnl, 0)}\n"
-            f"🛑 No more trades today"
-        )
-        return {"status": "DAILY_LOSS_LIMIT", "daily_pnl": daily_pnl}
-
-    r.setex("ACTIVE_TRADE", TRADE_INTERVAL, "1")
-
-    mode = get_trade_mode()
-
-    ltp_resp = await angel.ltp_batch("NFO", [token])
-    ltp_data = ltp_resp.get("data", [])
-    entry_ltp = float(ltp_data[0].get("ltp", 100.0)) if ltp_data else 100.0
-
-    strategy_key = SAFE_STRATEGY.split("_")[0]
-    lot_size = LOT_SIZES.get(strategy_key, 15)
-    profit = 0.0
-    order_id = f"{'PAPER' if mode == 'PAPER' else 'REAL'}_{int(time.time()*1000)}_{SAFE_STRATEGY[:4]}"
-
-    if SAFE_STRATEGY == "BANKNIFTY_PUT":
-        profit = round(entry_ltp * lot_size * lots, 2)
-        place_result = await angel.place_order({
-            "variety": "NORMAL",
-            "tradingsymbol": token,
-            "symboltoken": token,
-            "transactiontype": "SELL",
-            "exchange": "NFO",
-            "ordertype": "MARKET",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "quantity": str(lot_size * lots),
-        })
-        order_id = place_result.get("orderid", order_id)
-
-        await send_telegram(
-            f"🛡️ <b>BANKNIFTY PUT SELL</b>  [{mode}]\n"
-            f"📉 {token}\n"
-            f"💰 Premium: ₹{entry_ltp}\n"
-            f"✅ Expected Profit: ₹{profit}\n"
-            f"🔖 Order: {order_id}\n"
-            f"⏱️ Latency: {round(time.time()*1000-start_ms, 1)}ms"
-        )
-
-    elif SAFE_STRATEGY == "IRON_CONDOR":
-        lot_size = LOT_SIZES["NIFTY"]
-        profit = round(entry_ltp * lot_size * lots, 2)
-        place_result = await angel.place_order({
-            "variety": "NORMAL",
-            "tradingsymbol": token,
-            "symboltoken": token,
-            "transactiontype": "SELL",
-            "exchange": "NFO",
-            "ordertype": "MARKET",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "quantity": str(lot_size * lots),
-        })
-        order_id = place_result.get("orderid", order_id)
-
-        await send_telegram(
-            f"🔒 <b>NIFTY IRON CONDOR</b>  [{mode}]\n"
-            f"📊 CE+PE Credit: ₹{entry_ltp}\n"
-            f"💰 Total: ₹{profit}\n"
-            f"🛡️ Max Loss: ₹{abs(PER_TRADE_MAX_LOSS)}\n"
-            f"🔖 Order: {order_id}\n"
-            f"⏱️ {round(time.time()*1000-start_ms, 1)}ms"
-        )
-
-    elif SAFE_STRATEGY == "FINNIFTY":
-        lot_size = LOT_SIZES["FINNIFTY"]
-        profit = round(entry_ltp * lot_size * lots, 2)
-        place_result = await angel.place_order({
-            "variety": "NORMAL",
-            "tradingsymbol": token,
-            "symboltoken": token,
-            "transactiontype": "SELL",
-            "exchange": "NFO",
-            "ordertype": "MARKET",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "quantity": str(lot_size * lots),
-        })
-        order_id = place_result.get("orderid", order_id)
-
-        await send_telegram(
-            f"⚡ <b>FINNIFTY WEEKLY</b>  [{mode}]\n"
-            f"📉 {token} @ ₹{entry_ltp}\n"
-            f"💰 Expected: ₹{profit}\n"
-            f"🔖 Order: {order_id}\n"
-            f"⏱️ {round(time.time()*1000-start_ms, 1)}ms"
-        )
-
-    r.hset(f"{today_prefix}:{order_id}", {
-        "strategy": SAFE_STRATEGY,
-        "profit": str(profit),
-        "entry_ltp": str(entry_ltp),
-        "lots": str(lots),
-        "mode": mode,
-        "timestamp": str(int(time.time())),
-    })
-
-    await register_trailing_sl(
-        order_id=order_id,
-        token=token,
-        entry_ltp=entry_ltp,
-        lots=lots,
-        lot_size=lot_size,
-    )
-
-    latency = time.time() * 1000 - start_ms
-    return {
-        "order_id": order_id,
-        "status": "EXECUTED",
-        "mode": mode,
-        "strategy": SAFE_STRATEGY,
-        "entry_ltp": entry_ltp,
-        "profit_exp": profit,
-        "latency_ms": round(latency, 1),
-    }
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 10 — AUTO SELF-HEAL
-# ═══════════════════════════════════════════════════════════════════════
-async def run_self_heal() -> dict:
-    global KILL_SWITCH
-
-    issues = []
-    fixed = []
-    warnings = []
-
-    if KILL_SWITCH and is_trading_time():
-        KILL_SWITCH = False
-        r.delete("GLOBAL_KILL")
-        fixed.append("Kill switch reset")
-
-    active = r.get("ACTIVE_TRADE")
-    if active:
-        today_prefix = f"trade:{now_ist().strftime('%Y-%m-%d')}"
-        trade_keys = r.keys(f"{today_prefix}:*")
-        latest_ts = 0
-        for k in trade_keys:
-            ts = int(r.hget(k, "timestamp") or 0)
-            if ts > latest_ts:
-                latest_ts = ts
-        if latest_ts and (time.time() - latest_ts) > TRADE_INTERVAL:
-            r.delete("ACTIVE_TRADE")
-            fixed.append("Stuck ACTIVE_TRADE lock cleared")
-
-    with _trailing_lock:
-        orphaned = [oid for oid, t in _trailing_trades.items() if t["active"] and not r.get("ACTIVE_TRADE")]
-    if orphaned:
-        with _trailing_lock:
-            for oid in orphaned:
-                _trailing_trades[oid]["active"] = False
-        fixed.append(f"Orphaned trailing SL cleared: {len(orphaned)} trades")
-
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        warnings.append("Telegram credentials missing")
-
-    if get_trade_mode() == "REAL" and not angel.is_real:
-        issues.append("REAL mode ON but credentials missing")
-        set_trade_mode("PAPER")
-        fixed.append("Auto switched to PAPER mode")
-
-    today_prefix = f"trade:{now_ist().strftime('%Y-%m-%d')}"
-    trade_keys = r.keys(f"{today_prefix}:*")
-    daily_pnl = 0
-    for k in trade_keys:
-        profit_val = r.hget(k, "profit")
-        if profit_val:
-            daily_pnl += float(profit_val)
-    
-    if daily_pnl <= DAILY_MAX_LOSS and not KILL_SWITCH:
-        KILL_SWITCH = True
-        r.setex("GLOBAL_KILL", 86400, "1")
-        fixed.append(f"Kill switch ON — daily loss ₹{round(daily_pnl, 0)} limit hit")
-
-    try:
-        r.setex("_health_check", 5, "ok")
-        val = r.get("_health_check")
-        if val != "ok":
-            issues.append("Redis health check failed")
-        r.delete("_health_check")
-    except Exception as e:
-        issues.append(f"Redis error: {e}")
-
-    status = "HEALTHY" if not issues else "ISSUES_FOUND"
-
-    report_lines = [f"🔧 <b>SELF-HEAL REPORT</b>\n{'─'*28}"]
-    report_lines.append(f"📊 Status: <b>{status}</b>")
-    if fixed:
-        report_lines += [f"✅ {f}" for f in fixed]
-    if warnings:
-        report_lines += [f"⚠️ {w}" for w in warnings]
-    if issues:
-        report_lines += [f"❌ {i}" for i in issues]
-    if not fixed and not warnings and not issues:
-        report_lines.append("✅ எல்லாம் சரியாக உள்ளது!")
-
-    await send_telegram("\n".join(report_lines))
-
-    return {
-        "status": status,
-        "fixed": fixed,
-        "warnings": warnings,
-        "issues": issues,
-    }
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 11 — API ROUTES
-# ═══════════════════════════════════════════════════════════════════════
-@app.post("/kill")
-async def kill_switch_route():
-    global KILL_SWITCH
-    KILL_SWITCH = True
-    r.setex("GLOBAL_KILL", 86400, "1")
-    r.delete("ACTIVE_TRADE")
-    await send_telegram("🛑 <b>GLOBAL KILL — ALL STOPPED</b>")
-    return {"status": "KILL_ACTIVE"}
-
-@app.post("/resume")
-async def resume_trading():
-    global KILL_SWITCH
-    KILL_SWITCH = False
-    r.delete("GLOBAL_KILL")
-    await send_telegram("✅ <b>TRADING RESUMED</b>")
-    return {"status": "RESUMED"}
-
-@app.post("/fix")
-async def fix_route():
-    return await run_self_heal()
-
-@app.post("/mode/paper")
-async def switch_paper():
-    set_trade_mode("PAPER")
-    await send_telegram("📋 <b>PAPER TRADE MODE ON</b>\n📊 Simulated orders — பணம் போகாது")
-    return {"status": "PAPER_MODE"}
-
-@app.post("/mode/real")
-async def switch_real():
-    if not angel.is_real:
-        return {
-            "status": "ERROR",
-            "message": "Angel One credentials missing — set ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD",
-        }
-    set_trade_mode("REAL")
-    await send_telegram("⚡ <b>REAL TRADE MODE ON</b>\n💰 Angel One live orders active ⚠️")
-    return {"status": "REAL_MODE"}
-
-@app.get("/mode")
-async def get_mode_route():
-    return {"current_mode": get_trade_mode(), "angel_ready": angel.is_real}
-
-@app.post("/webhook")
-@limiter.limit("3/minute")
-async def telegram_webhook(request: Request):
-    try:
-        body = await request.body()
-        data = validate_hmac(body)
-
-        telegram_cmd = data.get("telegram_command", "")
-
-        if telegram_cmd == "/paper":
-            set_trade_mode("PAPER")
-            await send_telegram("📋 PAPER MODE ON")
-            return {"status": "PAPER_MODE"}
-
-        if telegram_cmd == "/real":
-            if not angel.is_real:
-                return {"status": "ERROR", "message": "Angel credentials missing"}
-            set_trade_mode("REAL")
-            await send_telegram("⚡ REAL MODE ON")
-            return {"status": "REAL_MODE"}
-
-        if telegram_cmd == "/mode":
-            await send_telegram(f"📊 Current mode: {get_trade_mode()}")
-            return {"mode": get_trade_mode()}
-
-        if telegram_cmd == "/fix":
-            return await run_self_heal()
-
-        if telegram_cmd == "/kill":
-            return await kill_switch_route()
-
-        if telegram_cmd == "/resume":
-            return await resume_trading()
-
-        if telegram_cmd == "/status":
-            trades_today = len(r.keys(f"trade:{now_ist().strftime('%Y-%m-%d')}:*"))
-            return {
-                "status": "ALIVE",
-                "mode": get_trade_mode(),
-                "kill_active": KILL_SWITCH,
-                "trades_today": trades_today,
-                "active_trade": bool(r.get("ACTIVE_TRADE")),
-                "trailing_trades": len([t for t in _trailing_trades.values() if t["active"]]),
-            }
-
-        valid_trade_cmds = ["/trade", "/put", "/condor", "/finnifty"]
-        if TELEGRAM_ONLY and telegram_cmd not in valid_trade_cmds:
-            return {
-                "status": "TELEGRAM_ONLY",
-                "allowed": valid_trade_cmds + ["/paper", "/real", "/mode", "/fix", "/kill", "/resume", "/status"],
-            }
-
-        if telegram_cmd == "/put":
-            data["token"] = data.get("token", "BANKNIFTY_51000_PUT")
-        elif telegram_cmd == "/condor":
-            data["token"] = data.get("token", "NIFTY_51000_CE_PE")
-        elif telegram_cmd == "/finnifty":
-            data["token"] = data.get("token", "FINNIFTY_23200_PUT")
-
-        if AI_PREDICT and telegram_cmd == "/trade":
-            best, confidence = await predict_best_strategy(data)
-            if confidence < 85:
-                return {"status": "LOW_CONFIDENCE", "confidence": confidence}
-            data["predicted_strategy"] = best
-
-        result = await safe_hft_order(
-            token=data.get("token", f"{SAFE_STRATEGY}_51000"),
-            lots=min(2, int(data.get("lots", 1))),
-        )
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        await send_telegram(f"❌ WEBHOOK ERROR: {str(e)}")
-        raise HTTPException(500, str(e))
-
-@app.get("/ping")
-async def ping():
-    today_prefix = f"trade:{now_ist().strftime('%Y-%m-%d')}"
-    trades_today = len(r.keys(f"{today_prefix}:*"))
-    return {
-        "status": "ALIVE",
-        "mode": get_trade_mode(),
-        "strategy": SAFE_STRATEGY,
-        "kill_active": KILL_SWITCH,
-        "trades_today": trades_today,
-        "daily_limit": DAILY_MAX_TRADES,
-        "angel_ready": angel.is_real,
-        "timestamp": now_ist().strftime("%H:%M:%S IST"),
-        "trailing_sl_active": len([t for t in _trailing_trades.values() if t["active"]]),
-    }
-
-@app.get("/predict")
-async def predict():
-    dummy = {"vix": 14.2, "volume_ratio": 1.8}
-    best, confidence = await predict_best_strategy(dummy)
-    return {
-        "best_strategy": best,
-        "confidence": f"{confidence}%",
-        "recommended": f"/{best.lower().replace('_', '')}",
-    }
-
-@app.get("/pnl")
-async def pnl_today():
-    today_prefix = f"trade:{now_ist().strftime('%Y-%m-%d')}"
-    trade_keys = r.keys(f"{today_prefix}:*")
-    trades = []
-    for k in trade_keys:
-        trade_data = r.hgetall(k)
-        if trade_data:
-            trades.append(trade_data)
-
-    total = sum(float(t.get("profit", 0)) for t in trades)
-    return {
-        "date": now_ist().strftime("%Y-%m-%d"),
-        "trades": len(trades),
-        "total_profit": round(total, 0),
-        "avg_profit": round(total / len(trades), 0) if trades else 0,
-        "daily_max_loss": DAILY_MAX_LOSS,
-        "remaining_loss": round(DAILY_MAX_LOSS - total, 0),
-    }
-
-@app.get("/sl/status")
-async def sl_status():
-    with _trailing_lock:
-        data = {
-            oid: {
-                "token": t["token"],
-                "entry_ltp": t["entry_ltp"],
-                "peak_profit": round(t["peak_profit"], 2),
-                "sl_level": round(t["sl_level"], 2),
-                "active": t["active"],
-            }
-            for oid, t in _trailing_trades.items()
-        }
-    return {"trailing_sl_trades": data, "count": len(data)}
-
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 12 — BACKGROUND MONITORS
-# ═══════════════════════════════════════════════════════════════════════
-async def background_monitor() -> None:
-    while True:
+    def get_profile(self) -> dict:
         try:
-            current_date = now_ist().strftime("%Y-%m-%d")
+            return self.smart_api.getProfile(self.refresh_token)
+        except Exception as e:
+            logger.error(f"Profile fetch error: {e}")
+            return {}
 
-            if 1425 <= hhmm_now() <= 1430:
-                if r.get(f"EOD_DONE_{current_date}") is None:
-                    logger.info("⚡ EOD EXECUTED")
+    def get_funds(self) -> float:
+        try:
+            resp = self.smart_api.rmsLimit()
+            if resp and resp.get("status"):
+                return float(resp["data"].get("availablecash", 0))
+        except Exception as e:
+            logger.error(f"Funds fetch error: {e}")
+        return 0.0
 
-                    with _trailing_lock:
-                        for oid in _trailing_trades:
-                            _trailing_trades[oid]["active"] = False
+    def place_order(
+        self,
+        symbol: str,
+        token: str,
+        action: str,
+        qty: int,
+        price: float,
+        order_type: str = "LIMIT",
+    ) -> Optional[str]:
+        try:
+            params = {
+                "variety": "NORMAL",
+                "tradingsymbol": symbol,
+                "symboltoken": token,
+                "transactiontype": action,
+                "exchange": "NFO",
+                "ordertype": order_type,
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": str(price),
+                "squareoff": "0",
+                "stoploss": "0",
+                "quantity": str(qty),
+            }
+            resp = self.smart_api.placeOrder(params)
+            if resp and resp.get("status"):
+                order_id = resp["data"]["orderid"]
+                logger.info(f"📋 Order placed: {order_id} | {action} {symbol} @ {price}")
+                return order_id
+            logger.error(f"Order failed: {resp}")
+            return None
+        except Exception as e:
+            logger.exception(f"Order error: {e}")
+            return None
 
-                    r.delete("ACTIVE_TRADE")
+    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
+        try:
+            resp = self.smart_api.cancelOrder(order_id, variety)
+            return bool(resp and resp.get("status"))
+        except Exception as e:
+            logger.error(f"Cancel order error: {e}")
+            return False
 
-                    await send_telegram(
-                        "🛑 <b>EOD AUTO-EXIT COMPLETE</b>\n"
-                        "இன்றைய வர்த்தகம் பாதுகாப்பாக முடிந்தது.\n"
-                        "நாளை காலை சந்திப்போம்! 🌅"
+    def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
+        try:
+            resp = self.smart_api.ltpData(exchange, symbol, token)
+            if resp and resp.get("status"):
+                return float(resp["data"]["ltp"])
+        except Exception as e:
+            logger.error(f"LTP error: {e}")
+        return 0.0
+
+    def get_positions(self) -> list:
+        try:
+            resp = self.smart_api.position()
+            if resp and resp.get("status"):
+                return resp["data"] or []
+        except Exception as e:
+            logger.error(f"Positions error: {e}")
+        return []
+
+    def square_off_all(self) -> bool:
+        positions = self.get_positions()
+        success = True
+        for pos in positions:
+            net_qty = int(pos.get("netqty", 0))
+            if net_qty == 0:
+                continue
+            action = "SELL" if net_qty > 0 else "BUY"
+            ltp = self.get_ltp("NFO", pos["tradingsymbol"], pos["symboltoken"])
+            price = round(ltp * 1.002, 1) if action == "SELL" else round(ltp * 0.998, 1)
+            oid = self.place_order(
+                pos["tradingsymbol"],
+                pos["symboltoken"],
+                action,
+                abs(net_qty),
+                price,
+            )
+            if not oid:
+                success = False
+        return success
+
+
+# ─────────────────────────────────────────────
+# WebSocket Feed Manager
+# ─────────────────────────────────────────────
+class WebSocketFeedManager:
+    def __init__(self, connector: AngelOneConnector, tick_callback):
+        self.connector = connector
+        self.tick_callback = tick_callback
+        self._ws: Optional[SmartWebSocketV2] = None
+        self._running = False
+        self._reconnect_delay = Config.WS_RECONNECT_BASE
+        self._subscriptions: list = []
+
+    async def start(self, tokens: list):
+        """Start WS feed with exponential backoff reconnect."""
+        self._subscriptions = tokens
+        self._running = True
+        while self._running:
+            try:
+                await self._connect()
+                self._reconnect_delay = Config.WS_RECONNECT_BASE
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                if self._running:
+                    logger.info(
+                        f"🔄 Reconnecting in {self._reconnect_delay:.1f}s..."
+                    )
+                    await asyncio.sleep(self._reconnect_delay)
+                    self._reconnect_delay = min(
+                        self._reconnect_delay * 2, Config.WS_RECONNECT_MAX
                     )
 
-                    r.setex(f"EOD_DONE_{current_date}", 86400, "true")
+    async def _connect(self):
+        loop = asyncio.get_event_loop()
 
-            await asyncio.sleep(60)
+        def on_open(ws):
+            logger.info("🟢 WebSocket connected")
+            token_list = [
+                {"exchangeType": 2, "tokens": self._subscriptions}
+            ]
+            ws.subscribe("ab1234", 3, token_list)
 
-        except Exception as e:
-            logger.error(f"Background monitor error: {e}")
-            await asyncio.sleep(60)
+        def on_data(ws, msg):
+            loop.call_soon_threadsafe(
+                asyncio.ensure_future,
+                self.tick_callback(msg),
+            )
 
-async def health_check_monitor() -> None:
-    """定期健康检查"""
-    while True:
+        def on_error(ws, error):
+            logger.error(f"WS Error: {error}")
+
+        def on_close(ws, code, msg):
+            logger.warning(f"🔴 WebSocket closed: {code} {msg}")
+
+        self._ws = SmartWebSocketV2(
+            self.connector.auth_token,
+            self.connector.config.API_KEY,
+            self.connector.config.CLIENT_ID,
+            self.connector.feed_token,
+        )
+        self._ws.on_open = on_open
+        self._ws.on_data = on_data
+        self._ws.on_error = on_error
+        self._ws.on_close = on_close
+
+        await asyncio.get_event_loop().run_in_executor(None, self._ws.connect)
+
+    def stop(self):
+        self._running = False
+        if self._ws:
+            try:
+                self._ws.close_connection()
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────
+# Telegram UI Manager
+# ─────────────────────────────────────────────
+class TelegramManager:
+    def __init__(self, token: str, chat_id: str, bot_engine):
+        self.token = token
+        self.chat_id = chat_id
+        self.engine = bot_engine
+        self.app: Optional[Application] = None
+        self._bot: Optional[Bot] = None
+
+    async def send(self, text: str, parse_mode: str = "HTML"):
         try:
-            await asyncio.sleep(300)  # Every 5 minutes
-            
-            if not is_trading_time():
-                continue
-                
-            # Check if stuck
-            active_trade = r.get("ACTIVE_TRADE")
-            if active_trade:
-                with _trailing_lock:
-                    active_sl = [t for t in _trailing_trades.values() if t["active"]]
-                
-                if not active_sl and active_trade:
-                    logger.warning("Stuck ACTIVE_TRADE without trailing SL - clearing")
-                    r.delete("ACTIVE_TRADE")
-                    
+            await self._bot.send_message(
+                chat_id=self.chat_id, text=text, parse_mode=parse_mode
+            )
         except Exception as e:
-            logger.error(f"Health check error: {e}")
+            logger.error(f"Telegram send error: {e}")
 
-# ═══════════════════════════════════════════════════════════════════════
-# SECTION 13 — MAIN
-# ═══════════════════════════════════════════════════════════════════════
+    async def setup(self):
+        self.app = Application.builder().token(self.token).build()
+        self._bot = self.app.bot
+
+        self.app.add_handler(CommandHandler("start", self._cmd_start))
+        self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("stop", self._cmd_stop))
+        self.app.add_handler(CallbackQueryHandler(self._button_handler))
+
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling(drop_pending_updates=True)
+        logger.info("📱 Telegram bot started")
+
+    async def shutdown(self):
+        if self.app:
+            await self.app.updater.stop()
+            await self.app.stop()
+            await self.app.shutdown()
+
+    async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 Check Strategy", callback_data="check_strategy"),
+                InlineKeyboardButton("💹 Status", callback_data="status"),
+            ],
+            [
+                InlineKeyboardButton("📝 Paper Trade", callback_data="start_paper"),
+                InlineKeyboardButton("💰 Live Trade", callback_data="start_live"),
+            ],
+            [
+                InlineKeyboardButton("⏹️ Stop Bot", callback_data="stop_bot"),
+                InlineKeyboardButton("🔍 Positions", callback_data="positions"),
+            ],
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "🤖 <b>Ultra-Fast HFT Bot</b> — Angel One\n"
+            "BankNifty/FinNifty Options Trader\n\n"
+            "Choose an action:",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+
+    async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = await self.engine.get_status_message()
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🛑 Initiating emergency stop...")
+        await self.engine.emergency_stop("Manual /stop command")
+
+    async def _button_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+
+        if data == "status":
+            msg = await self.engine.get_status_message()
+            await query.edit_message_text(msg, parse_mode="HTML")
+
+        elif data == "check_strategy":
+            await query.edit_message_text("🔍 Analyzing market conditions...", parse_mode="HTML")
+            result = await self.engine.analyze_strategy()
+            await query.edit_message_text(result, parse_mode="HTML")
+
+        elif data == "start_paper":
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Start Paper Trade", callback_data="confirm_paper"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+                ]
+            ]
+            await query.edit_message_text(
+                "⚠️ <b>Confirm Paper Trade?</b>\nVirtual trades only. No real money.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML",
+            )
+
+        elif data == "start_live":
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ CONFIRM LIVE", callback_data="confirm_live"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+                ]
+            ]
+            await query.edit_message_text(
+                "🚨 <b>CONFIRM LIVE TRADE?</b>\nReal money at risk! Capital: ₹20,000\n"
+                "Max Loss: ₹1,000 | Target: ₹1,500",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML",
+            )
+
+        elif data == "confirm_paper":
+            await self.engine.set_mode("paper")
+            await query.edit_message_text("✅ <b>Paper Trade Mode Active</b>", parse_mode="HTML")
+
+        elif data == "confirm_live":
+            await self.engine.set_mode("live")
+            await query.edit_message_text("🚀 <b>Live Trade Mode Active!</b>", parse_mode="HTML")
+
+        elif data == "positions":
+            msg = await self.engine.get_positions_message()
+            await query.edit_message_text(msg, parse_mode="HTML")
+
+        elif data == "stop_bot":
+            await query.edit_message_text("🛑 Emergency stop initiated...")
+            await self.engine.emergency_stop("Button: Stop Bot")
+
+        elif data == "cancel":
+            await query.edit_message_text("❌ Cancelled.")
+
+
+# ─────────────────────────────────────────────
+# Main Trading Engine
+# ─────────────────────────────────────────────
+class TradingEngine:
+    def __init__(self):
+        self.config = Config()
+        self.connector = AngelOneConnector(self.config)
+        self.state = StateManager()
+        self.risk = RiskManager(self.config, self.state)
+        self.strategy = AlphaStrategy()
+        self.telegram: Optional[TelegramManager] = None
+        self.ws_manager: Optional[WebSocketFeedManager] = None
+        self._mode = self.config.TRADE_MODE
+        self._running = False
+        self._last_price: dict = {}
+        self._last_alert_price: dict = {}
+
+    async def initialize(self):
+        if not self.connector.login():
+            raise RuntimeError("Angel One login failed!")
+        self.state.load()
+        self.telegram = TelegramManager(
+            self.config.TELEGRAM_TOKEN,
+            self.config.TELEGRAM_CHAT_ID,
+            self,
+        )
+        await self.telegram.setup()
+
+    async def set_mode(self, mode: str):
+        self._mode = mode
+        self.state.set("trade_mode", mode)
+        self.state.save()
+        await self.telegram.send(
+            f"🔄 Mode changed to <b>{mode.upper()}</b>"
+        )
+
+    async def run(self):
+        """Main event loop."""
+        self._running = True
+        await self.telegram.send(
+            "🤖 <b>Trading Bot Started!</b>\n"
+            f"Mode: <b>{self._mode.upper()}</b>\n"
+            f"Capital: ₹{self.config.CAPITAL:,.0f}\n"
+            f"Max Loss: ₹{self.config.MAX_DAILY_LOSS:,.0f} | Target: ₹{self.config.DAILY_TARGET:,.0f}"
+        )
+
+        # Restore open trade if bot restarted
+        open_trade = self.state.get("open_trade")
+        if open_trade:
+            await self.telegram.send(
+                f"🔁 Resuming tracking for: <b>{open_trade.get('symbol')}</b>"
+            )
+
+        # Start WebSocket and other tasks concurrently
+        tokens = self.state.get("ws_tokens", ["26009"])  # BankNifty default
+
+        ws_task = asyncio.create_task(self._start_ws(tokens))
+        candle_task = asyncio.create_task(self._candle_aggregator())
+        risk_task = asyncio.create_task(self._risk_monitor_loop())
+        status_task = asyncio.create_task(self._periodic_status())
+
+        await asyncio.gather(ws_task, candle_task, risk_task, status_task)
+
+    async def _start_ws(self, tokens: list):
+        self.ws_manager = WebSocketFeedManager(self.connector, self._on_tick)
+        await self.ws_manager.start(tokens)
+
+    async def _on_tick(self, msg: dict):
+        """Sub-millisecond tick processor."""
+        try:
+            token = str(msg.get("token", ""))
+            ltp = msg.get("last_traded_price", 0) / 100.0  # paise → rupees
+            volume = msg.get("volume_trade_for_the_day", 0)
+            timestamp = msg.get("exchange_timestamp", time.time())
+
+            if ltp <= 0:
+                return
+
+            prev_price = self._last_price.get(token, ltp)
+            self._last_price[token] = ltp
+
+            # Feed to strategy
+            signal = self.strategy.on_tick(token, ltp, volume, timestamp)
+
+            # Execute signal
+            if signal and self._running:
+                await self._execute_signal(signal, ltp)
+
+            # Trailing SL check
+            open_trade = self.state.get("open_trade")
+            if open_trade and open_trade.get("token") == token:
+                await self._manage_trailing_sl(open_trade, ltp)
+
+            # 1% price alert
+            last_alert = self._last_alert_price.get(token, ltp)
+            if abs(ltp - last_alert) / last_alert >= 0.01:
+                self._last_alert_price[token] = ltp
+                direction = "📈" if ltp > last_alert else "📉"
+                await self.telegram.send(
+                    f"{direction} <b>1% Move</b> | {token}\n"
+                    f"Price: ₹{ltp:.2f}"
+                )
+
+        except Exception as e:
+            logger.error(f"Tick error: {e}")
+
+    async def _execute_signal(self, signal: dict, ltp: float):
+        """Fire order within 100ms of signal."""
+        t0 = time.monotonic()
+
+        if not self.risk.can_trade():
+            return
+
+        symbol = signal["symbol"]
+        token = signal["token"]
+        action = signal["action"]  # BUY or SELL
+        qty = signal["qty"]
+
+        # Limit price with buffer for immediate fill
+        if action == "BUY":
+            price = round(ltp * 1.002, 1)
+        else:
+            price = round(ltp * 0.998, 1)
+
+        if self._mode == "live":
+            order_id = self.connector.place_order(symbol, token, action, qty, price)
+        else:
+            order_id = f"PAPER-{int(time.time())}"
+
+        latency_ms = (time.monotonic() - t0) * 1000
+
+        if order_id:
+            trade = {
+                "order_id": order_id,
+                "symbol": symbol,
+                "token": token,
+                "action": action,
+                "qty": qty,
+                "entry_price": price,
+                "sl_price": signal.get("sl"),
+                "target_price": signal.get("target"),
+                "entry_time": datetime.now().isoformat(),
+                "peak_profit": 0,
+                "breakeven_moved": False,
+                "trailing_active": False,
+            }
+            self.state.set("open_trade", trade)
+            self.state.save()
+
+            await self.telegram.send(
+                f"🚀 <b>{'PAPER ' if self._mode == 'paper' else ''}ORDER PLACED</b>\n"
+                f"Symbol: <code>{symbol}</code>\n"
+                f"Action: <b>{action}</b> @ ₹{price:.2f}\n"
+                f"Qty: {qty} | SL: ₹{signal.get('sl', 0):.2f}\n"
+                f"Target: ₹{signal.get('target', 0):.2f}\n"
+                f"⚡ Latency: <b>{latency_ms:.1f}ms</b>"
+            )
+
+    async def _manage_trailing_sl(self, trade: dict, ltp: float):
+        """Zero-loss trailing stop logic."""
+        entry = trade["entry_price"]
+        sl = trade["sl_price"]
+        action = trade["action"]
+
+        if action == "BUY":
+            profit = (ltp - entry) * trade["qty"]
+        else:
+            profit = (entry - ltp) * trade["qty"]
+
+        trade["peak_profit"] = max(trade.get("peak_profit", 0), profit)
+
+        # Move to breakeven
+        if profit >= self.config.BREAKEVEN_TRIGGER and not trade.get("breakeven_moved"):
+            trade["sl_price"] = entry
+            trade["breakeven_moved"] = True
+            self.state.set("open_trade", trade)
+            self.state.save()
+            await self.telegram.send(
+                f"🔒 <b>SL → Break-Even</b>\n"
+                f"Symbol: <code>{trade['symbol']}</code>\n"
+                f"SL moved to entry: ₹{entry:.2f}\n"
+                f"Current P&L: ₹{profit:.0f}"
+            )
+
+        # Activate trailing
+        elif profit >= self.config.TRAIL_TRIGGER:
+            if not trade.get("trailing_active"):
+                trade["trailing_active"] = True
+
+            # Trail SL by every ₹100 profit increment
+            trail_count = int((profit - self.config.TRAIL_TRIGGER) / self.config.TRAIL_STEP)
+            if action == "BUY":
+                new_sl = entry + (trail_count * self.config.TRAIL_STEP / trade["qty"])
+            else:
+                new_sl = entry - (trail_count * self.config.TRAIL_STEP / trade["qty"])
+
+            if action == "BUY" and new_sl > trade["sl_price"]:
+                trade["sl_price"] = new_sl
+                self.state.set("open_trade", trade)
+                self.state.save()
+                await self.telegram.send(
+                    f"📈 <b>SL Trailed UP</b>\n"
+                    f"Symbol: <code>{trade['symbol']}</code>\n"
+                    f"New SL: ₹{new_sl:.2f} | P&L: ₹{profit:.0f}"
+                )
+            elif action == "SELL" and new_sl < trade["sl_price"]:
+                trade["sl_price"] = new_sl
+                self.state.set("open_trade", trade)
+                self.state.save()
+                await self.telegram.send(
+                    f"📉 <b>SL Trailed DOWN</b>\n"
+                    f"Symbol: <code>{trade['symbol']}</code>\n"
+                    f"New SL: ₹{new_sl:.2f} | P&L: ₹{profit:.0f}"
+                )
+
+        # SL Hit check
+        if action == "BUY" and ltp <= sl:
+            await self._exit_trade(trade, ltp, "SL HIT 🔴")
+        elif action == "SELL" and ltp >= sl:
+            await self._exit_trade(trade, ltp, "SL HIT 🔴")
+        elif action == "BUY" and ltp >= trade.get("target_price", 1e9):
+            await self._exit_trade(trade, ltp, "TARGET HIT 🎯")
+        elif action == "SELL" and ltp <= trade.get("target_price", 0):
+            await self._exit_trade(trade, ltp, "TARGET HIT 🎯")
+
+    async def _exit_trade(self, trade: dict, ltp: float, reason: str):
+        """Exit position and update P&L."""
+        symbol = trade["symbol"]
+        token = trade["token"]
+        action = "SELL" if trade["action"] == "BUY" else "BUY"
+        qty = trade["qty"]
+        exit_price = round(ltp * 0.998 if action == "SELL" else ltp * 1.002, 1)
+
+        if self._mode == "live":
+            self.connector.place_order(symbol, token, action, qty, exit_price)
+
+        entry = trade["entry_price"]
+        if trade["action"] == "BUY":
+            pnl = (exit_price - entry) * qty
+        else:
+            pnl = (entry - exit_price) * qty
+
+        self.risk.record_pnl(pnl)
+        self.state.set("open_trade", None)
+        self.state.save()
+
+        await self.telegram.send(
+            f"{'🎯' if 'TARGET' in reason else '🔴'} <b>{reason}</b>\n"
+            f"Symbol: <code>{symbol}</code>\n"
+            f"Exit @ ₹{exit_price:.2f}\n"
+            f"P&L: <b>₹{pnl:+.0f}</b>\n"
+            f"Day P&L: <b>₹{self.risk.daily_pnl:+.0f}</b>"
+        )
+
+        # Check daily loss limit
+        if self.risk.daily_pnl <= -self.config.MAX_DAILY_LOSS:
+            await self.emergency_stop("Max daily loss reached")
+        elif self.risk.daily_pnl >= self.config.DAILY_TARGET:
+            await self.emergency_stop("Daily target achieved 🎉")
+
+    async def _candle_aggregator(self):
+        """Aggregate ticks into 5-min candles for strategy."""
+        while self._running:
+            await asyncio.sleep(1)
+            self.strategy.aggregate_candles()
+
+    async def _risk_monitor_loop(self):
+        """Continuous risk check every second."""
+        while self._running:
+            await asyncio.sleep(1)
+            if self.risk.daily_pnl <= -self.config.MAX_DAILY_LOSS:
+                await self.emergency_stop("Risk limit breach!")
+
+    async def _periodic_status(self):
+        """Send status every hour."""
+        while self._running:
+            await asyncio.sleep(3600)
+            msg = await self.get_status_message()
+            await self.telegram.send(msg)
+
+    async def get_status_message(self) -> str:
+        balance = self.connector.get_funds()
+        day_pnl = self.risk.daily_pnl
+        trade = self.state.get("open_trade")
+        vix = await self._get_vix()
+        health = self._market_health_index(vix)
+
+        trade_info = "None"
+        if trade:
+            trade_info = (
+                f"{trade['symbol']} {trade['action']} @ ₹{trade['entry_price']:.2f}\n"
+                f"   SL: ₹{trade['sl_price']:.2f}"
+            )
+
+        return (
+            f"📊 <b>Bot Status</b> — {datetime.now().strftime('%H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: ₹{balance:,.0f}\n"
+            f"📈 Day P&L: <b>₹{day_pnl:+,.0f}</b>\n"
+            f"📉 Max Loss: ₹{self.config.MAX_DAILY_LOSS:,.0f} | Target: ₹{self.config.DAILY_TARGET:,.0f}\n"
+            f"🎯 Open Trade: {trade_info}\n"
+            f"🌡️ VIX: {vix:.2f} | Market Health: {health}\n"
+            f"⚙️ Mode: <b>{self._mode.upper()}</b>"
+        )
+
+    async def get_positions_message(self) -> str:
+        positions = self.connector.get_positions()
+        if not positions:
+            return "📭 <b>No Open Positions</b>"
+        lines = ["📋 <b>Open Positions</b>\n━━━━━━━━━━━━━━━"]
+        for p in positions:
+            if int(p.get("netqty", 0)) != 0:
+                pnl = float(p.get("unrealisedpnl", 0))
+                lines.append(
+                    f"• <code>{p['tradingsymbol']}</code>\n"
+                    f"  Qty: {p['netqty']} | P&L: ₹{pnl:+.0f}"
+                )
+        return "\n".join(lines)
+
+    async def analyze_strategy(self) -> str:
+        signal = self.strategy.get_current_signal()
+        vix = await self._get_vix()
+        health = self._market_health_index(vix)
+
+        if vix > 20:
+            return (
+                f"⚠️ <b>Market Unstable — Avoid</b>\n"
+                f"VIX: {vix:.2f} (High volatility)\n"
+                f"Market Health: {health}\n\n"
+                f"Recommendation: Wait for VIX < 20"
+            )
+
+        if signal:
+            return (
+                f"✅ <b>Strong Signal Found!</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"Symbol: <code>{signal.get('symbol', 'N/A')}</code>\n"
+                f"Action: <b>{signal.get('action', 'N/A')}</b>\n"
+                f"RSI: {signal.get('rsi', 0):.1f} | Supertrend: {signal.get('supertrend', 'N/A')}\n"
+                f"Volume Spike: {'✅' if signal.get('volume_spike') else '❌'}\n"
+                f"VIX: {vix:.2f} | Health: {health}"
+            )
+        return (
+            f"🔍 <b>No Clear Signal</b>\n"
+            f"Conditions not fully met.\n"
+            f"VIX: {vix:.2f} | Health: {health}\n\n"
+            f"Strategy requires: Supertrend + RSI + Volume Spike"
+        )
+
+    async def _get_vix(self) -> float:
+        try:
+            ltp = self.connector.get_ltp("NSE", "India VIX", "1")
+            return ltp if ltp > 0 else 15.0
+        except Exception:
+            return 15.0
+
+    def _market_health_index(self, vix: float) -> str:
+        if vix < 13:
+            return "🟢 Excellent"
+        elif vix < 17:
+            return "🟡 Good"
+        elif vix < 20:
+            return "🟠 Cautious"
+        else:
+            return "🔴 Dangerous"
+
+    async def emergency_stop(self, reason: str):
+        """Hard stop — liquidate all and shutdown."""
+        logger.critical(f"EMERGENCY STOP: {reason}")
+        self._running = False
+
+        if self.ws_manager:
+            self.ws_manager.stop()
+
+        # Square off all positions
+        if self._mode == "live":
+            success = self.connector.square_off_all()
+            sq_status = "✅ All squared off" if success else "⚠️ Manual check required"
+        else:
+            sq_status = "📝 Paper mode — no real positions"
+
+        self.state.set("open_trade", None)
+        self.state.set("bot_killed_today", date.today().isoformat())
+        self.state.save()
+
+        await self.telegram.send(
+            f"🛑 <b>BOT EMERGENCY STOP</b>\n"
+            f"Reason: {reason}\n"
+            f"{sq_status}\n"
+            f"Day P&L: <b>₹{self.risk.daily_pnl:+,.0f}</b>\n\n"
+            f"Bot process will now terminate."
+        )
+
+        await asyncio.sleep(2)
+        await self.telegram.shutdown()
+        sys.exit(0)
+
+
+# ─────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────
+async def main():
+    engine = TradingEngine()
+
+    # Graceful shutdown on SIGTERM (Railway.app sends this)
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(
+            sig,
+            lambda: asyncio.create_task(engine.emergency_stop("System signal received")),
+        )
+
+    try:
+        await engine.initialize()
+        await engine.run()
+    except Exception as e:
+        logger.exception(f"Fatal error: {e}")
+        if engine.telegram:
+            await engine.telegram.send(f"💥 <b>FATAL ERROR</b>\n<code>{e}</code>")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        reload=False,
-    )
+    asyncio.run(main())
