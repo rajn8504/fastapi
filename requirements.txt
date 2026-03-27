@@ -1,17 +1,7 @@
-# Broker API
-smartapi-python==1.4.1
-
-# Security & Authentication
+smartapi-python==1.5.5
+python-telegram-bot==22.6
 pyotp==2.9.0
-python-dotenv==1.0.1
-
-# Asynchronous & Networking
-asyncio==3.4.3
-httpx==0.27.0
-
-# Telegram Bot Interface
-python-telegram-bot==20.8
-
-# Data Handling
-pandas==2.2.1
-numpy==1.26.4
+httpx==0.28.1
+websocket-client==1.8.0
+logzero==1.7.0
+pycryptodome==3.23.0
