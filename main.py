@@ -1,33 +1,48 @@
-"Paper trading armed" வருவது **சரியே** ✅ — bot ready state-ல் இருக்கிறது.
+பிரச்சனை தெரிகிறது! **Chat-ல் நான் எழுதிய text** main.py-ல் line 1-ல் போய்விட்டது — file corrupt ஆகிவிட்டது.
 
-**ஆனால் நின்றது ஏன்?** இரண்டு காரணங்கள்:
-1. **இப்போது இரவு 9:02 PM** — Market closed (9:15 AM – 3:30 PM மட்டுமே)
-2. **API Key இல்லாமல்** WebSocket data வருவதில்லை → Signals generate ஆவதில்லை
+உடனே சரிசெய்கிறேன்:
 
-**Solution:** Paper mode-ல் **Simulation** add செய்கிறேன் — API key இல்லாமலும் bot-ஐ fully test செய்யலாம்:
+Viewed main.py:1-10
 
-Viewed main.py:820-870
-Viewed main.py:700-760
-Viewed main.py:760-800
-Viewed main.py:865-905
+உள்ளூரில் file சரியாக இருக்கிறது — Railway-ல் மட்டும் corrupt ஆனது. நீங்கள் manual copy-paste செய்யும்போது chat text தவறுதலாக சேர்ந்திருக்கிறது.
 
-இப்போது simulation engine சேர்க்கிறேன் — API key இல்லாமலும் bot முழுவதும் demo செய்யலாம்:
-
-Edited main.py
-
-Deploy செய்யுங்கள். இப்போது full flow இப்படி இருக்கும்:
+Railway deploy எப்படி செய்கிறீர்கள் என்று பொறுத்து fix செய்யுங்கள்:
 
 ---
 
-## 🎮 Demo Mode — இனி என்ன நடக்கும்:
+### Option A — GitHub வழி deploy செய்தால்:
 
-| நேரம் | என்ன வரும் |
-|---|---|
-| Deploy ஆனவுடன் | "Demo Simulation Mode Active" message |
-| `/starttrade` → Paper | "Paper trading armed ✅" |
-| **6-8 நிமிடம்** | 🎯 Auto signal — CALL/PUT |
-| Signal வந்தவுடன் | Order placed, SL set message |
-| Profit > ₹300 | 🔒 SL moved to breakeven |
-| Profit > ₹700 | 📈 SL trailing starts |
+GitHub-ல் `main.py` கோப்பை திறந்து ✏️ edit icon click → **முழு content-ஐயும் delete** → கீழே உள்ள சரியான file-ஐ copy paste செய்யுங்கள்:
 
-**Telegram-ல் /checkstrategy அனுப்பினால்** — live RSI, Supertrend, Volume status காண்பிக்கும் 📊
+Ran command: `Get-Content "f:\n8n\main.py" -Raw | Set-Clipboard`
+
+**உங்கள் Clipboard-ல் சரியான main.py content இப்போது copy ஆகிவிட்டது!**
+
+---
+
+### இப்போது இதை செய்யுங்கள்:
+
+**GitHub வழி:**
+1. GitHub → உங்கள் repo → `main.py` → ✏️ Edit
+2. `Ctrl+A` → எல்லாவற்றையும் select
+3. `Ctrl+V` → paste (clipboard-ல் இருக்கும் சரியான content)
+4. Commit changes → Railway auto-deploy
+
+---
+
+**Railway CLI வழி (Terminal திறந்து):**
+```
+railway up
+```
+
+---
+
+**Railway Dashboard வழி:**
+1. Railway → உங்கள் service → Settings
+2. "Redeploy" அல்லது file upload option பயன்படுத்துங்கள்
+
+---
+
+> 💡 **நினைவில் வையுங்கள்:** எப்போதும் VS Code-ல் உள்ள `f:\n8n\main.py` கோப்பை மட்டுமே copy செய்யுங்கள் — chat text-ஐ paste செய்யாதீர்கள்!
+
+Clipboard ready — GitHub-ல் paste செய்யுங்கள் ✅
