@@ -1,764 +1,1074 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║   NIFTY Options Algo Trading System — Complete Production Build  ║
-║   Version: v6 + API Resilience + FastAPI + Auto TSL & EOD Exit   ║
-╠══════════════════════════════════════════════════════════════════╣
-║   ALL FEATURES INCLUDED: 18 Safety Gates, Background Monitor,    ║
-║   Trailing SL, 2:25 PM Square-Off, Exit Signal Routing.          ║
-╚══════════════════════════════════════════════════════════════════╝
+main.py — Ultra-Fast Async Trading Bot
+Angel One SmartAPI | BankNifty/FinNifty Weekly Options
+Railway.app-ready | Telegram Command & Control
 """
 
-import time, datetime, threading, json, os, asyncio
-from datetime import timezone
-from typing import Optional, Tuple, List, Dict, Any
-from fastapi import FastAPI, Request, BackgroundTasks
-import uvicorn
-import pytz
+from __future__ import annotations
 
-app = FastAPI()
+import asyncio
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 0 — CONSTANTS
-# ══════════════════════════════════════════════════════════════════
-WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "ABC123_DEV_ONLY")
-LOT_SIZE         = 25
-TICK_SIZE        = 0.05     
-VIX_LIMIT        = 18.0
-GAP_FULL_LOT     = 0.005    
-GAP_HALF_LOT     = 0.010    
-GAP_REJECT       = 0.010    
-DAILY_TARGET     = 5000
-DAILY_MAX_LOSS   = 2000
-MAX_TRADE_MIN    = 25
-SIGNAL_SCORE_MIN = 5
+# ── Third-party (lazy imports where heavy) ────────────────────────────────────
+import httpx
+import pyotp
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
-MAX_LTP_AGE_MS  = 3000      
-RETRY_DELAY     = 0.8       
-MAX_RETRIES     = 3
-ORDER_STATUS_VALID    = {"complete","open","trigger pending", "after market order req received","modified"}
-ORDER_STATUS_TERMINAL = {"rejected","cancelled"}
+from strategies import (
+    AlphaStrategy,
+    IndicatorEngine,
+    SignalResult,
+    Tick,
+    TrailingState,
+    market_health_index,
+)
 
-TRADE_START     = 930
-TRADE_END       = 1430
-PRE_CLOSE       = 1425      
-FREEZE_ZONE     = 1429      
-MARKET_OPEN     = 915
-MARKET_CLOSE    = 1530
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 1 — IST TIMEZONE
-# ══════════════════════════════════════════════════════════════════
-_IST = pytz.timezone("Asia/Kolkata")
-def _now_ist() -> datetime.datetime:
-    return datetime.datetime.now(_IST)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("main")
 
-_IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+IST = ZoneInfo("Asia/Kolkata")
 
-def today_ist() -> str:
-    return _now_ist().strftime("%Y-%m-%d")
+# ──────────────────────────────────────────────────────────────────────────────
+# Config from environment variables
+# ──────────────────────────────────────────────────────────────────────────────
 
-def now_utc_iso() -> str:
-    return datetime.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+class Cfg:
+    # Angel One
+    API_KEY          = os.getenv("API_KEY", "")
+    CLIENT_ID        = os.getenv("CLIENT_ID", "")
+    PASSWORD         = os.getenv("PASSWORD", "")
+    TOTP_SECRET      = os.getenv("TOTP_SECRET", "")
 
-def ts_to_ms(iso: str) -> int:
-    try:
-        return int(datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
-    except:
-        return int(time.time() * 1000)
+    # Telegram
+    TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def ms_to_ist_hhmm(now_ms: int) -> int:
-    dt = datetime.datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
-    ist = dt.astimezone(_IST_TZ)
-    return ist.hour * 100 + ist.minute
+    # Risk
+    CAPITAL          = float(os.getenv("CAPITAL", "20000"))
+    MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "1000"))
+    DAILY_TARGET     = float(os.getenv("DAILY_TARGET", "1500"))
+    LOT_SIZE         = int(os.getenv("LOT_SIZE", "1"))          # number of lots
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 2 — SESSION HELPERS
-# ══════════════════════════════════════════════════════════════════
-def is_trading_session(hhmm: int) -> bool:
-    return TRADE_START <= hhmm <= TRADE_END
+    # Instruments
+    UNDERLYING       = os.getenv("UNDERLYING", "BANKNIFTY")      # BANKNIFTY | FINNIFTY
+    TRADE_MODE       = os.getenv("TRADE_MODE", "paper").lower()  # paper | live
 
-def is_new_entry_allowed(now_ms: int = None) -> bool:
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
-    return TRADE_START <= t < PRE_CLOSE
+    # State file for Railway restart recovery
+    STATE_FILE       = Path(os.getenv("STATE_FILE", "db.json"))
 
-def should_square_off_now(now_ms: int = None) -> bool:
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
-    return PRE_CLOSE <= t < FREEZE_ZONE
+    # Market hours (IST HHMM)
+    MARKET_START     = int(os.getenv("MARKET_START", "915"))
+    MARKET_END       = int(os.getenv("MARKET_END", "1525"))
+    TRADE_START      = int(os.getenv("TRADE_START", "930"))
+    TRADE_END        = int(os.getenv("TRADE_END", "1430"))
 
-def is_freeze_zone(now_ms: int = None) -> bool:
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
-    return t == FREEZE_ZONE
 
-def is_market_open(now_ms: int = None) -> bool:
-    t = ms_to_ist_hhmm(now_ms) if now_ms else (_now_ist().hour * 100 + _now_ist().minute)
-    return MARKET_OPEN <= t <= MARKET_CLOSE
+def _hhmm() -> int:
+    now = datetime.now(IST)
+    return now.hour * 100 + now.minute
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 3 — REDIS (PRODUCTION SWAP)
-# ══════════════════════════════════════════════════════════════════
-class MockRedis:
-    def __init__(self):
-        self._s = {}; self._e = {}
-        self._lock = threading.Lock()
-    def _clean(self, k):
-        if k in self._e and time.time() > self._e[k]:
-            self._s.pop(k, None); self._e.pop(k, None); return True
-        return False
-    def get(self, k):
-        with self._lock: self._clean(k); return self._s.get(k)
-    def set(self, k, v, nx=False, ex=None):
-        with self._lock:
-            self._clean(k)
-            if nx and k in self._s: return False
-            self._s[k] = str(v)
-            if ex: self._e[k] = time.time() + ex
+
+def _is_trading_hours() -> bool:
+    t = _hhmm()
+    return Cfg.TRADE_START <= t <= Cfg.TRADE_END
+
+
+def _now_label() -> str:
+    return datetime.now(IST).strftime("%H:%M:%S")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistent State (db.json)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ActiveTrade:
+    order_id: str
+    symbol: str
+    token: str
+    option_type: str          # "CE" or "PE"
+    lot_size: int
+    entry_price: float
+    sl_price: float
+    entry_time: str           # ISO string
+    mode: str                 # "paper" | "live"
+
+    def trail(self) -> TrailingState:
+        return TrailingState(
+            entry_price=self.entry_price,
+            current_sl=self.sl_price,
+            high_water=self.entry_price,
+            lot_size=self.lot_size * _lot_qty(self.symbol),
+        )
+
+
+def _lot_qty(symbol: str) -> int:
+    """Official lot sizes for index options (validate annually)."""
+    sizes = {"BANKNIFTY": 15, "FINNIFTY": 40, "NIFTY": 75}
+    for k, v in sizes.items():
+        if k in symbol.upper():
+            return v
+    return 25
+
+
+class StateStore:
+    """Thread-safe persistence to db.json for Railway restart recovery."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+        self.daily_pnl: float = 0.0
+        self.trade_count: int = 0
+        self.active_trade: Optional[ActiveTrade] = None
+        self.day: str = ""
+        self._load()
+
+    def _load(self) -> None:
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        if self._path.exists():
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                if data.get("day") == today:
+                    self.daily_pnl = float(data.get("daily_pnl", 0.0))
+                    self.trade_count = int(data.get("trade_count", 0))
+                    raw_trade = data.get("active_trade")
+                    if raw_trade:
+                        self.active_trade = ActiveTrade(**raw_trade)
+                    self.day = today
+                    logger.info("State restored from %s — PnL=%.0f trades=%d",
+                                self._path, self.daily_pnl, self.trade_count)
+                    return
+            except Exception as exc:
+                logger.warning("State load failed: %s", exc)
+        self.day = today
+
+    async def save(self) -> None:
+        async with self._lock:
+            data: Dict[str, Any] = {
+                "day": self.day,
+                "daily_pnl": self.daily_pnl,
+                "trade_count": self.trade_count,
+                "active_trade": asdict(self.active_trade) if self.active_trade else None,
+                "saved_at": datetime.now(IST).isoformat(),
+            }
+            try:
+                self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception as exc:
+                logger.error("State save failed: %s", exc)
+
+    def day_blocked(self) -> bool:
+        """True if daily loss limit or target has been hit."""
+        return (
+            self.daily_pnl <= -Cfg.MAX_DAILY_LOSS
+            or self.daily_pnl >= Cfg.DAILY_TARGET
+        )
+
+    def record_closed_trade(self, pnl: float) -> None:
+        self.daily_pnl = round(self.daily_pnl + pnl, 2)
+        self.trade_count += 1
+        self.active_trade = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AngelOne client wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AngelClient:
+    """Manages SmartConnect session with TOTP re-login."""
+
+    def __init__(self) -> None:
+        self._client: Optional[SmartConnect] = None
+        self.auth_token: str = ""
+        self.feed_token: str = ""
+        self._login_time: float = 0.0
+
+    def login(self) -> bool:
+        try:
+            totp = pyotp.TOTP(Cfg.TOTP_SECRET).now()
+            self._client = SmartConnect(api_key=Cfg.API_KEY)
+            session = self._client.generateSession(Cfg.CLIENT_ID, Cfg.PASSWORD, totp)
+            if not (session and session.get("status")):
+                raise RuntimeError(f"Session failed: {session}")
+            self.auth_token = session["data"]["jwtToken"]
+            self.feed_token = self._client.getfeedToken()
+            self._login_time = time.time()
+            logger.info("✅ Angel One login successful")
             return True
-    def setex(self, k, ex, v): return self.set(k, str(v), ex=ex)
-    def delete(self, *keys):
-        with self._lock:
-            for k in keys: self._s.pop(k, None); self._e.pop(k, None)
-    def incr(self, k):
-        with self._lock:
-            v = int(self._s.get(k, 0)) + 1
-            self._s[k] = str(v); return v
-    def incrbyfloat(self, k, a):
-        with self._lock:
-            v = float(self._s.get(k, 0)) + a
-            self._s[k] = f"{v:.4f}"; return v
-    def expire(self, k, s):
-        with self._lock:
-            if k in self._s: self._e[k] = time.time() + s; return True
+        except Exception as exc:
+            logger.error("❌ Login failed: %s", exc)
             return False
-    def hset(self, k, mapping=None, **kw):
-        with self._lock:
-            if not isinstance(self._s.get(k), dict): self._s[k] = {}
-            if mapping: self._s[k].update({str(a): str(b) for a, b in mapping.items()})
-    def hgetall(self, k):
-        with self._lock:
-            self._clean(k)
-            v = self._s.get(k, {})
-            return dict(v) if isinstance(v, dict) else {}
-    def keys(self, p="*"):
-        with self._lock:
-            px = p.replace("*", "")
-            return [k for k in list(self._s) if k.startswith(px)]
-    def rpush(self, k, *vals):
-        with self._lock:
-            if not isinstance(self._s.get(k), list): self._s[k] = []
-            self._s[k].extend([str(v) for v in vals])
-            return len(self._s[k])
-    def lrange(self, k, s, e):
-        with self._lock:
-            v = self._s.get(k, [])
-            if not isinstance(v, list): return []
-            return v[s:] if e == -1 else v[s:e + 1]
-    def flushall(self):
-        with self._lock: self._s.clear(); self._e.clear()
 
-REDIS_URL = os.environ.get("REDIS_URL")
-if REDIS_URL:
+    def ensure_session(self) -> None:
+        """Re-login if session is older than 6 hours."""
+        if time.time() - self._login_time > 21600:
+            logger.info("Session refresh triggered")
+            self.login()
+
+    def place_order(self, params: Dict[str, Any]) -> str:
+        """Returns order_id or raises."""
+        self.ensure_session()
+        if not self._client:
+            raise RuntimeError("Client not initialized")
+        resp = self._client.placeOrder(params)
+        order_id = str(resp["data"]["orderid"])
+        return order_id
+
+    def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
+        self.ensure_session()
+        if not self._client:
+            return 0.0
+        resp = self._client.ltpData(exchange, symbol, token)
+        return float(resp["data"]["ltp"])
+
+    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> None:
+        try:
+            if self._client:
+                self._client.cancelOrder(order_id=order_id, variety=variety)
+        except Exception as exc:
+            logger.warning("Cancel order %s failed: %s", order_id, exc)
+
+    def get_funds(self) -> float:
+        self.ensure_session()
+        if not self._client:
+            return 0.0
+        try:
+            data = self._client.rmsLimit().get("data", {})
+            return float(data.get("availablecash", 0))
+        except Exception:
+            return 0.0
+
+    @property
+    def raw(self) -> Optional[SmartConnect]:
+        return self._client
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Instrument resolver
+# ──────────────────────────────────────────────────────────────────────────────
+
+SCRIP_MASTER_URL = (
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+)
+
+STRIKE_STEP = {"BANKNIFTY": 100, "FINNIFTY": 50, "NIFTY": 50}
+SPOT_TOKEN   = {"BANKNIFTY": "26009", "FINNIFTY": "26037", "NIFTY": "26000"}
+
+
+async def fetch_scrip_master() -> List[Dict[str, Any]]:
+    cache = Path("scrip_master_cache.json")
     try:
-        import redis
-        r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    except ImportError:
-        r = MockRedis()
-else:
-    r = MockRedis()
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(SCRIP_MASTER_URL)
+            r.raise_for_status()
+            rows = r.json()
+            cache.write_text(json.dumps(rows), encoding="utf-8")
+            return rows
+    except Exception as exc:
+        logger.warning("Scrip master download failed (%s), using cache", exc)
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        raise
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 4 — REDIS HELPERS
-# ══════════════════════════════════════════════════════════════════
-def daily_key(base: str) -> str: return f"{base}:{today_ist()}"
-def daily_get(base: str, default="0") -> str:
-    v = r.get(daily_key(base)); return v if v is not None else default
-def daily_set(base: str, val, ex=86400): r.setex(daily_key(base), ex, str(val))
-def daily_incr(base: str) -> int:
-    k = daily_key(base); c = r.incr(k)
-    if c == 1: r.expire(k, 86400)
-    return c
-def daily_float_add(base: str, amount: float) -> float:
-    k = daily_key(base); v = r.incrbyfloat(k, amount)
-    r.expire(k, 86400); return float(v)
-def round_lot(qty: int) -> int:
-    if qty <= 0: return LOT_SIZE
-    return max(LOT_SIZE, (qty // LOT_SIZE) * LOT_SIZE)
-def split_qty(total: int) -> Tuple[int, int]:
-    half = total // 2; partial = round_lot(half)
-    trail = total - partial
-    if trail < LOT_SIZE: return 0, total
-    return partial, round_lot(trail)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 5 — AUDIT LOGGER
-# ══════════════════════════════════════════════════════════════════
-class AuditLog:
-    @staticmethod
-    def _entry(t: str, d: dict) -> str: return json.dumps({"ts": now_utc_iso(), "type": t, **d})
-    @staticmethod
-    def trade(order_id, signal, qty, premium, sl, status, detail=""):
-        r.rpush("audit:trades", AuditLog._entry("TRADE", {"order_id": order_id, "signal": signal, "qty": qty, "premium": premium, "sl": sl, "status": status, "detail": detail}))
-    @staticmethod
-    def rejection(stage, reason, sig=None):
-        r.rpush("audit:rejections", AuditLog._entry("REJECTION", {"stage": stage, "reason": reason, "signal": (sig or {}).get("signal", ""), "candle_id": (sig or {}).get("candle_id", "")}))
-    @staticmethod
-    def error(component, error, context=None):
-        r.rpush("audit:errors", AuditLog._entry("ERROR", {"component": component, "error": str(error), "context": json.dumps(context or {})}))
-    @staticmethod
-    def day_bias(result: dict):
-        r.rpush("audit:day_bias", AuditLog._entry("DAY_BIAS", {"trade_allowed": result.get("trade_allowed"), "score": result.get("score"), "bias": result.get("bias", ""), "reasons": result.get("reasons", [])}))
+def find_atm_option(rows: List[Dict], underlying: str, spot_price: float,
+                    option_type: str, trade_date: str) -> Dict[str, Any]:
+    """Return the nearest ATM weekly option contract dict."""
+    step = STRIKE_STEP.get(underlying, 100)
+    atm = round(spot_price / step) * step
+    from datetime import date as _date, datetime as _dt
+    today = _dt.strptime(trade_date, "%Y-%m-%d").date()
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 6 — PIPELINE GUARD
-# ══════════════════════════════════════════════════════════════════
-def pipeline_guard(func):
-    def wrapper(*args, **kwargs):
-        try: return func(*args, **kwargs)
-        except ValueError: raise
-        except Exception as e:
-            AuditLog.error(func.__name__, str(e), {"args": str(args)[:200]})
-            raise ValueError(f"INTERNAL_ERROR:{func.__name__}:{type(e).__name__}")
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 7 — API RESILIENCE LAYER
-# ══════════════════════════════════════════════════════════════════
-def fetch_ltp_with_retry(client, exchange: str, symbol: str, token: str, max_retries: int = MAX_RETRIES, max_age_ms:  int = MAX_LTP_AGE_MS) -> dict:
-    last_err = None
-    for attempt in range(1, max_retries + 1):
+    candidates = []
+    for row in rows:
+        if row.get("exch_seg") != "NFO":
+            continue
+        if row.get("instrumenttype") != "OPTIDX":
+            continue
+        if row.get("name") != underlying:
+            continue
+        sym = str(row.get("symbol", ""))
+        if not sym.endswith(option_type):
+            continue
+        raw_expiry = str(row.get("expiry", "")).strip().upper()
         try:
-            t0   = int(time.time() * 1000)
-            resp = client.ltpData(exchange, symbol, token)
-            t1   = int(time.time() * 1000)
-            ltp  = float(resp["data"]["ltp"])
-            if ltp <= 0: raise ValueError(f"LTP=0 on attempt {attempt}")
-            return {"ltp": ltp, "fetch_time_ms": t1, "latency_ms": t1 - t0, "attempts": attempt, "is_fresh": (t1 - t0) < max_age_ms}
-        except ValueError: raise
-        except Exception as e:
-            last_err = e
-            if attempt < max_retries: time.sleep(RETRY_DELAY)
-    raise ValueError(f"LTP_FETCH_FAILED after {max_retries} attempts: {last_err}")
+            expiry = _dt.strptime(raw_expiry, "%d%b%Y").date()
+        except ValueError:
+            continue
+        if expiry < today:
+            continue
+        raw_strike = float(row.get("strike", 0)) / 100.0
+        candidates.append((expiry, abs(raw_strike - atm), row))
 
-def parse_market_depth(raw: dict) -> dict:
-    depth  = raw.get("depth", {}); buys = depth.get("buy",  []) or []; sells = depth.get("sell", []) or []
-    ltp    = float(raw.get("ltp", 0))
-    best_bid = float(buys[0].get("price", 0)) if buys  else 0.0
-    best_ask = float(sells[0].get("price", 0)) if sells else 0.0
-    bid_qty  = int(buys[0].get("quantity", 0)) if buys  else 0
-    ask_qty  = int(sells[0].get("quantity", 0)) if sells else 0
-    vol      = int(raw.get("tradedVolume", 0)); oi = int(raw.get("openInterest", 0))
-    depth_ok = bool(buys and sells and best_bid > 0 and best_ask > 0)
-    return {"bid": best_bid, "ask": best_ask if depth_ok else (ltp * 1.001 if ltp > 0 else 0.0), "spread": round(best_ask - best_bid, 2) if depth_ok else None, "bid_qty": bid_qty, "ask_qty": ask_qty, "vol": vol, "oi": oi, "ltp": ltp, "depth_available": depth_ok}
+    if not candidates:
+        raise RuntimeError(f"No {underlying} {option_type} contracts found")
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
 
-def check_liquidity_safe(client, option: dict) -> dict:
-    try:
-        raw = client.getMarketData("FULL", [{}])
-        fetched = (raw.get("data", {}).get("fetched") or [{}])
-        parsed = parse_market_depth(fetched[0] if fetched else {})
-    except Exception as e:
-        AuditLog.error("LIQUIDITY", str(e))
-        return {"ok": True, "warn": f"depth_api_error:{e}", "depth_available": False}
-    issues = []
-    if parsed["spread"] is not None and parsed["spread"] > 3.0: issues.append(f"spread={parsed['spread']:.1f}")
-    if parsed["vol"] < 500: issues.append(f"vol={parsed['vol']}")
-    if parsed["oi"] < 10000: issues.append(f"OI={parsed['oi']}")
-    if parsed["depth_available"]:
-        if parsed["bid_qty"] < 50: issues.append(f"bid_depth={parsed['bid_qty']}")
-        if parsed["ask_qty"] < 50: issues.append(f"ask_depth={parsed['ask_qty']}")
-    if issues: raise ValueError(f"LIQUIDITY:{';'.join(issues)}")
-    return {**parsed, "ok": True}
 
-def verify_order_with_retry(client, order_id: str, max_retries: int  = MAX_RETRIES, retry_delay: float = RETRY_DELAY) -> dict:
-    for attempt in range(1, max_retries + 1):
-        try:
-            orders = client.orderBook().get("data") or []
-            for o in orders:
-                if str(o.get("orderid", "")) == str(order_id):
-                    status = (o.get("status") or "").lower().strip()
-                    if status in ORDER_STATUS_VALID: return {"found": True, "status": status, "order_data": o, "attempts": attempt}
-                    if status in ORDER_STATUS_TERMINAL: raise ValueError(f"ORDER_{status.upper()}:{o.get('text','no reason')}")
-                    break  
-        except ValueError: raise
-        except Exception: pass
-        if attempt < max_retries: time.sleep(retry_delay)
-    return {"found": False, "status": "unknown", "attempts": max_retries}
+# ──────────────────────────────────────────────────────────────────────────────
+# Order helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-def round_to_tick(price: float, tick: float = TICK_SIZE) -> float:
-    if tick <= 0: return round(price, 2)
-    return round(round(price / tick) * tick, 2)
+TICK_SIZE = 0.05
 
-def calculate_sl_ticked(premium: float, atr: float = None) -> dict:
-    if atr and atr > 0:
-        raw_sl  = premium - (atr * 1.2)
-        sl_pct  = (premium - raw_sl) / premium * 100
-        sl_pct  = min(45.0, max(1.0, sl_pct))
-        raw_sl  = premium * (1 - sl_pct / 100); method  = "ATR"
-    else:
-        raw_sl  = premium * 0.70; sl_pct  = 30.0; method  = "FIXED_30PCT"
-    return {"sl_price": round_to_tick(raw_sl), "sl_raw": round(raw_sl, 2), "sl_pct": round(sl_pct, 1), "tick_size": TICK_SIZE, "method": method}
 
-def eod_square_off(client, positions: list, now_ms: int = None) -> list:
-    results = []
-    for pos in positions:
-        symbol = pos.get("symbol", ""); token = pos.get("opt_token", ""); qty = int(float(pos.get("remaining_qty", 0))); oid = pos.get("order_id", "")
-        if qty <= 0:
-            results.append({"order_id": oid, "status": "SKIP", "qty": 0}); continue
-        try:
-            # 1. Cancel pending SL first
-            try: client.cancelOrder(order_id=pos.get("sl_order_id", ""), variety="STOPLOSS")
-            except: pass
-            
-            # 2. Market Sell
-            resp = client.placeOrder({
-                "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token, "transactiontype": "SELL",
-                "exchange": "NFO", "ordertype": "MARKET", "quantity": qty, "producttype": "INTRADAY",
-            })
-            results.append({"order_id": oid, "exit_oid": resp["data"]["orderid"], "status": "SQUARED_OFF", "qty": qty, "reason": "PRE_CLOSE_2:25"})
-        except Exception as e:
-            results.append({"order_id": oid, "status": "FAILED", "error": str(e), "qty": qty})
-    return results
+def _round_tick(price: float) -> float:
+    return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
-def fetch_live_capital(client) -> dict:
-    try:
-        data = client.rmsLimit().get("data", {}); net = float(data.get("net", 0)); utilized = float(data.get("utilisedamt", 0))
-        available = max(0.0, float(data.get("availablecash", net)))
-        return {"available": available, "utilized": utilized, "net": net, "source": "LIVE_RMS"}
-    except Exception as e:
-        return {"available": 0.0, "utilized": 0.0, "net": 0.0, "source": "RMS_FAILED", "error": str(e)}
 
-def check_capital_live(client, order_cost: float) -> dict:
-    cap = fetch_live_capital(client)
-    if cap["source"] == "RMS_FAILED": raise ValueError(f"RMS_UNAVAILABLE:{cap.get('error','')}")
-    available = cap["available"]; max_use = available * 0.35
-    if order_cost > max_use: raise ValueError(f"CAPITAL_INSUFFICIENT:need={order_cost:.0f} max35%={max_use:.0f} avail={available:.0f}")
-    return {**cap, "order_cost": order_cost, "max_use": max_use, "ok": True}
+def _sl_price(entry: float, option_type: str, pct: float = 0.30) -> float:
+    """Initial SL = 30% below entry for long option."""
+    return _round_tick(entry * (1.0 - pct))
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 8 — ANGEL ONE CLIENT SETUP
-# ══════════════════════════════════════════════════════════════════
-class MockAngelOne:
-    def __init__(self, ltp=150.0):
-        self.ltp = ltp; self._ctr = 1000; self._orders = {}
-    def ltpData(self, exchange, symbol, token): return {"data": {"ltp": self.ltp}}
-    def placeOrder(self, order):
-        oid = str(self._ctr); self._ctr += 1
-        self._orders[oid] = {"orderid": oid, "status": "complete", "quantity": order.get("quantity", 0)}
-        return {"data": {"orderid": oid}}
-    def orderBook(self): return {"data": list(self._orders.values())}
-    def modifyOrder(self, data):
-        oid = data.get("orderid")
-        if oid in self._orders: self._orders[oid]["triggerprice"] = data.get("triggerprice", "0")
-        return {"status": "success"}
-    def cancelOrder(self, order_id, variety):
-        if order_id in self._orders: self._orders[order_id]["status"] = "cancelled"
-        return {"status": "success"}
-    def getMarketData(self, mode, tokens):
-        mid = self.ltp
-        return {"data": {"fetched": [{"ltp": self.ltp, "depth": {"buy": [{"price": mid-0.5, "quantity": 500}], "sell": [{"price": mid+0.5, "quantity": 500}]}, "tradedVolume": 2000, "openInterest": 50000, "ask": mid+0.5}]}}
-    def rmsLimit(self): return {"data": {"net": "200000", "utilisedamt": "20000", "availablecash": "180000"}}
 
-def get_angel_client():
-    api_key = os.environ.get("API_KEY"); client_id = os.environ.get("CLIENT_ID")
-    pwd = os.environ.get("PASSWORD"); totp_str = os.environ.get("TOTP_STR")
-    if api_key and client_id and pwd and totp_str:
-        try:
-            import pyotp
-            from SmartApi import SmartConnect
-            client = SmartConnect(api_key=api_key); totp = pyotp.TOTP(totp_str).now()
-            client.generateSession(client_id, pwd, totp); return client
-        except Exception as e:
-            AuditLog.error("ANGEL_LOGIN_FAILED", str(e)); raise ValueError(f"LOGIN_ERROR: {str(e)}")
-    return MockAngelOne()
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 9 — DAY BIAS ENGINE
-# ══════════════════════════════════════════════════════════════════
-@pipeline_guard
-def run_day_bias(market: dict) -> dict:
-    today = today_ist(); score = 0; checks = {}; reasons = []
-    vix = float(market.get("vix", 99))
-    checks["vix_ok"] = vix < VIX_LIMIT
-    if checks["vix_ok"]: score += 1
-    else: reasons.append(f"VIX={vix:.1f}")
-
-    today_open = float(market.get("today_open", 0)); prev_close = float(market.get("prev_close",  1))
-    gap_pct = abs(today_open - prev_close) / prev_close if prev_close else 1
-
-    if   gap_pct < GAP_FULL_LOT: lot_mult=1.0; checks["gap_ok"]=True;  score+=1
-    elif gap_pct < GAP_HALF_LOT: lot_mult=0.5; checks["gap_ok"]=True;  score+=1; reasons.append(f"Gap={gap_pct*100:.2f}%→half_lot")
-    else:                         lot_mult=0.0; checks["gap_ok"]=False; reasons.append(f"Gap={gap_pct*100:.2f}%>1%")
-
-    c1o=float(market.get("candle1_open",0)); c1c=float(market.get("candle1_close",0))
-    c2o=float(market.get("candle2_open",0)); c2c=float(market.get("candle2_close",0))
-    c2h=float(market.get("candle2_high",c2c)); c2l=float(market.get("candle2_low",c2c)); ltp=float(market.get("ltp",0))  
-
-    primary_clear  = (c1c>c1o)==(c2c>c2o) and (abs(c2c-c1o)/c1o>0.001 if c1o else False)
-    breakout_bull  = ltp>c2h*1.001 if ltp>0 else False
-    breakout_bear  = ltp<c2l*0.999 if ltp>0 else False
-    fallback_clear = breakout_bull or breakout_bear
-
-    checks["direction_clear"] = primary_clear or fallback_clear
-    if checks["direction_clear"]:
-        score+=1
-        if primary_clear: checks["bias"]="BULLISH" if c1c>c1o else "BEARISH"
-        else:             checks["bias"]="BREAKOUT_BULL" if breakout_bull else "BREAKOUT_BEAR"
-    else: checks["bias"]="UNCLEAR"; reasons.append("No clear first-candle direction")
-
-    vwap = float(market.get("vwap",1)); adx = float(market.get("adx", 0)); p_now = ltp if ltp>0 else c2c
-    vd = abs(p_now-vwap)/vwap if vwap else 1
-    checks["vwap_or_trend"] = vd<0.003 or adx>25
-    if checks["vwap_or_trend"]: score+=1
-    else: reasons.append(f"Price {vd*100:.2f}% from VWAP, ADX={adx:.1f}")
-
-    adx_prev=float(market.get("adx_prev",0))
-    checks["adx_ok"] = (adx>20 and adx>adx_prev) or adx>25
-    if checks["adx_ok"]: score+=1
-    else: reasons.append(f"ADX={adx:.1f}")
-
-    vol_ratio=float(market.get("volume_ratio",0))
-    checks["volume_ok"] = vol_ratio>=1.2
-    if checks["volume_ok"]: score+=1
-    else: reasons.append(f"Volume={vol_ratio:.2f}x")
-
-    trade_today = (checks["vix_ok"] and gap_pct<GAP_REJECT and score>=SIGNAL_SCORE_MIN)
-
-    result = {
-        "trade_allowed": trade_today, "score": score, "score_max": 6, "bias": checks.get("bias","UNCLEAR"), "lot_multiplier": lot_mult,
-        "checks": checks, "reasons": reasons, "gap_pct": round(gap_pct*100,3), "timestamp": now_utc_iso(),
+async def place_limit_order_async(
+    angel: AngelClient,
+    symbol: str,
+    token: str,
+    qty: int,
+    action: str,        # "BUY" | "SELL"
+    ltp: float,
+    buffer: float = 2.0,
+) -> str:
+    """Non-blocking limit order with a 2-pt buffer for immediate fill."""
+    price = _round_tick(ltp + buffer if action == "BUY" else ltp - buffer)
+    params = {
+        "variety": "NORMAL",
+        "tradingsymbol": symbol,
+        "symboltoken": token,
+        "transactiontype": action,
+        "exchange": "NFO",
+        "ordertype": "LIMIT",
+        "producttype": "INTRADAY",
+        "duration": "IOC",
+        "quantity": str(qty),
+        "price": str(price),
     }
-    r.hset(f"day_bias:{today}", mapping={
-        "trade_allowed": "1" if trade_today else "0", "score": str(score), "bias": checks.get("bias","UNCLEAR"),
-        "lot_multiplier": str(lot_mult), "gap_pct": str(round(gap_pct*100,3)), "reasons": "|".join(reasons) or "ALL_PASS", "timestamp": result["timestamp"],
-    })
-    r.expire(f"day_bias:{today}", 86400)
-    if not trade_today: r.setex(f"block:{today}", 86400, "NO_TRADE_DAY")
-    AuditLog.day_bias(result)
-    return result
+    if Cfg.TRADE_MODE == "paper":
+        simulated_id = f"PAPER_{int(time.time() * 1000)}"
+        logger.info("[PAPER] %s %s qty=%d @%.2f (limit)", action, symbol, qty, price)
+        return simulated_id
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 10 — SIGNAL SCORER
-# ══════════════════════════════════════════════════════════════════
-def score_signal(sig: dict) -> dict:
-    score=0; details={}
-    action=sig.get("signal",""); price=float(sig.get("price",0))
-    rsi=float(sig.get("rsi",0));  vwap=float(sig.get("vwap",1))
-    ema9=float(sig.get("ema9",0)); ema21=float(sig.get("ema21",0))
+    loop = asyncio.get_running_loop()
+    order_id = await loop.run_in_executor(None, lambda: angel.place_order(params))
+    return order_id
 
-    rsi_ok = ((action=="BUY_CE" and 50<=rsi<=65) or (action=="BUY_PE" and 35<=rsi<=50))
-    vwap_ok= ((action=="BUY_CE" and price>vwap) or (action=="BUY_PE" and price<vwap))
-    ema_ok = ((action=="BUY_CE" and ema9>ema21 and price>ema9) or (action=="BUY_PE" and ema9<ema21 and price<ema9))
-    pat_ok = bool(sig.get("pattern"))
 
-    details["rsi_zone"]=rsi_ok; details["vwap_align"]=vwap_ok
-    details["ema_trend"]=ema_ok; details["candle_pattern"]=pat_ok
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram notification
+# ──────────────────────────────────────────────────────────────────────────────
 
-    for ok in [rsi_ok,vwap_ok,ema_ok,pat_ok]:
-        if ok: score+=1
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str) -> None:
+        self._bot: Optional[Bot] = Bot(token=token) if token else None
+        self._chat_id = chat_id
 
-    trade_ok = score>=3
-    if not (vwap_ok and ema_ok):
-        trade_ok=False; details["critical_fail"]="VWAP or EMA misaligned"
-
-    return {"score": score, "score_max": 4, "trade_signal": trade_ok, "details": details, "failed": [k for k,v in details.items() if isinstance(v,bool) and not v]}
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 11 — WEBHOOK VALIDATOR (WITH EXIT SIGNAL SUPPORT)
-# ══════════════════════════════════════════════════════════════════
-@pipeline_guard
-def validate_webhook(data: dict, now_ms: int = None) -> dict:
-    if now_ms is None: now_ms = int(time.time()*1000)
-    today = today_ist()
-
-    if data.get("secret") != WEBHOOK_SECRET:
-        AuditLog.rejection("AUTH","UNAUTHORIZED",data); raise ValueError("UNAUTHORIZED")
-
-    # NEW: Check if this is an EXIT signal
-    signal_str = data.get("signal", "").upper()
-    is_exit = signal_str in ("EXIT_CE", "EXIT_PE", "SELL")
-
-    # Basic validations required for both ENTRY and EXIT
-    for f in ["signal","price","candle_id","timestamp"]:
-        if not str(data.get(f,"")).strip(): raise ValueError(f"MISSING_FIELD:{f}")
-    
-    try: price=float(data["price"]); assert 15000<price<35000
-    except: raise ValueError(f"PRICE_INVALID:{data.get('price')}")
-
-    age = now_ms - ts_to_ms(data["timestamp"])
-    if age>30000: AuditLog.rejection("STALE",f"{age}ms",data); raise ValueError(f"STALE:{age}ms")
-
-    ist_t = ms_to_ist_hhmm(now_ms)
-    if not is_trading_session(ist_t):
-        AuditLog.rejection("SESSION",f"time={ist_t}",data); raise ValueError(f"OUTSIDE_SESSION:{ist_t}")
-
-    # --- IF EXIT SIGNAL, BYPASS ENTRY GATES ---
-    if is_exit:
-        return {"status": "PASS", "is_exit": True, "trade_signal": True}
-
-    # --- ENTRY GATES ONLY ---
-    if signal_str not in ("BUY_CE","BUY_PE"): raise ValueError(f"UNKNOWN_SIGNAL:{signal_str}")
-    for f in ["rsi","vwap","ema9","ema21","pattern"]:
-        if not str(data.get(f,"")).strip(): raise ValueError(f"MISSING_FIELD:{f}")
-
-    rsi=float(data["rsi"])
-    if signal_str=="BUY_CE" and not(50<=rsi<=65): raise ValueError(f"RSI_INVALID:CE=50-65 got {rsi}")
-    if signal_str=="BUY_PE" and not(35<=rsi<=50): raise ValueError(f"RSI_INVALID:PE=35-50 got {rsi}")
-
-    if not is_new_entry_allowed(now_ms): raise ValueError("PRE_CLOSE:No new entries after 2:25 PM")
-
-    bias = r.hgetall(f"day_bias:{today}")
-    if not bias: AuditLog.rejection("DAY_GATE","NOT_SET",data); raise ValueError("DAY_BIAS_NOT_SET")
-    if bias.get("trade_allowed")!="1": AuditLog.rejection("DAY_GATE","NO_TRADE_DAY",data); raise ValueError(f"NO_TRADE_DAY:{bias.get('reasons','')}")
-
-    lot_mult = float(bias.get("lot_multiplier",1.0))
-    if lot_mult==0.0: raise ValueError("GAP_TOO_LARGE")
-
-    dupe=f"seen:{data['candle_id']}"
-    if r.get(dupe): raise ValueError("DUPLICATE_SIGNAL")
-    r.set(dupe,"1",ex=300)
-
-    day_score = int(bias.get("score",0)); rate_ms = 60000 if day_score==6 else 90000
-    last = r.get("last_alert")
-    if last and (now_ms-int(last))<rate_ms: raise ValueError(f"RATE_LIMIT:{rate_ms//1000}s")
-    r.set("last_alert",str(now_ms))
-
-    max_trades = 4 if day_score==6 else 2; count = int(daily_get("trade_count","0"))
-    if count>=max_trades: raise ValueError(f"MAX_TRADES:{count}/{max_trades}")
-
-    blocked=r.get(f"block:{today}")
-    if blocked: raise ValueError(f"BLOCKED:{blocked}")
-
-    pnl=float(daily_get("pnl","0"))
-    if pnl>=DAILY_TARGET: r.setex(f"block:{today}",86400,"TARGET_HIT"); raise ValueError("DAILY_TARGET_HIT")
-    if pnl<=-DAILY_MAX_LOSS: r.setex(f"block:{today}",86400,"LOSS_LIMIT"); raise ValueError("DAILY_LOSS_HIT")
-
-    loss_count = int(daily_get("loss_count","0")); last_loss_ms = r.get(f"last_loss_time:{today}")
-    if loss_count>=2: r.setex(f"block:{today}",86400,"TWO_LOSSES"); raise ValueError("STOPPED:2_losses")
-    if last_loss_ms:
-        elapsed=now_ms-int(last_loss_ms)
-        if elapsed<600000: raise ValueError(f"LOSS_COOLDOWN:{max(1,(600000-elapsed)//60000)}min")
-
-    vix_raw=r.get("vix_cache")
-    if not vix_raw: raise ValueError("VIX_UNAVAILABLE")
-    if float(vix_raw)>=VIX_LIMIT: raise ValueError(f"VIX_HIGH:{vix_raw}")
-    if r.get("event_block"): raise ValueError("EVENT_BLOCK")
-
-    opt_ltp=float(r.get("option_ltp_cache") or 0)
-    if opt_ltp==0: raise ValueError("OPTION_LTP_MISSING:run morning LTP fetch first")
-    total_cap = float(r.get("total_capital") or 0); capital_used = float(daily_get("capital_used","0"))
-    if total_cap>0:
-        if (capital_used+opt_ltp*LOT_SIZE*lot_mult)/total_cap>0.35: raise ValueError("CAPITAL_LIMIT")
-
-    sig_result=score_signal(data)
-    if not sig_result["trade_signal"]:
-        AuditLog.rejection("SIGNAL",f"score={sig_result['score']}/4",data); raise ValueError(f"SIGNAL_WEAK:score={sig_result['score']}/4")
-
-    if not r.set("trade_lock","1",nx=True,ex=3): raise ValueError("TRADE_LOCKED")
-    try: new_count=daily_incr("trade_count")
-    finally: r.delete("trade_lock")
-
-    return {"status": "PASS", "is_exit": False, "lot_mult": lot_mult, "vix": float(vix_raw), "trade_num": new_count, "sig_score": sig_result["score"], "day_score": day_score, "max_trades": max_trades, "rate_limit": rate_ms//1000}
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 12 — ORDER EXECUTOR & EXIT LOGIC
-# ══════════════════════════════════════════════════════════════════
-@pipeline_guard
-def place_order(client, lots: int, token_id: str) -> dict:
-    lock_key = f"order_lock:{token_id}"
-    if not r.set(lock_key,"1",nx=True,ex=300): raise ValueError("ALREADY_EXECUTED")
-    try:
-        tok = r.hgetall(f"token:{token_id}")
-        if not tok: raise ValueError("INVALID_TOKEN")
-        if tok.get("used")=="1": raise ValueError("TOKEN_USED")
-        if int(time.time()*1000)>int(tok.get("expiry",0)): raise ValueError("TOKEN_EXPIRED")
-
-        lot_mult = float(tok.get("lot_mult","1.0"))
-        qty      = round_lot(int(lots*LOT_SIZE*lot_mult))
-
-        liq = check_liquidity_safe(client, tok)
-        if not liq.get("ok",True): raise ValueError("LIQUIDITY_FAIL")
-
-        ltp_info = fetch_ltp_with_retry(client, "NFO", tok.get("symbol",""), tok.get("opt_token",""))
-        premium  = ltp_info["ltp"]
-
-        check_capital_live(client, premium*qty)
-
-        spread      = liq.get("spread") or 2.0; ask = liq.get("ask") or premium
-        dyn_buffer  = max(1.0, min(5.0, spread*1.5)); limit_price = round_to_tick(ask + dyn_buffer)
-
-        resp     = client.placeOrder({"ordertype":"LIMIT","quantity":qty, "price":str(limit_price),"duration":"IOC"})
-        order_id = resp["data"]["orderid"]
-
-        verify = verify_order_with_retry(client, order_id)
-        if not verify["found"]:
-            resp     = client.placeOrder({"ordertype":"MARKET","quantity":qty})
-            order_id = resp["data"]["orderid"]
-            if not verify_order_with_retry(client, order_id)["found"]: raise ValueError("ORDER_UNVERIFIED")
-
-        atr_val  = float(tok.get("atr",0))
-        sl_info  = calculate_sl_ticked(premium, atr_val); sl_price = sl_info["sl_price"]
-
-        sl_resp  = client.placeOrder({"ordertype":"STOPLOSS_MARKET", "quantity":qty,"triggerprice":str(sl_price)})
-        sl_id    = sl_resp["data"]["orderid"]
-        if not verify_order_with_retry(client, sl_id)["found"]:
-            client.placeOrder({"ordertype":"MARKET","quantity":qty})
-            AuditLog.error("SL_FAILED",f"order={order_id} forced exit")
-            raise ValueError("SL_FAILED_FORCED_EXIT")
-
-        r.hset(f"token:{token_id}", mapping={"used":"1"}); partial_qty, trail_qty = split_qty(qty)
-
-        r.hset(f"position:{order_id}", mapping={
-            "symbol": tok.get("symbol",""), "opt_token": tok.get("opt_token",""), "signal": tok.get("signal",""),
-            "entry_price": str(premium), "initial_qty": str(qty), "remaining_qty": str(qty), "partial_done": "false",
-            "sl_order_id": sl_id, "current_sl": str(sl_price), "sl_pct": str(sl_info["sl_pct"]), "sl_method": sl_info["method"],
-            "entry_time": str(int(time.time())), "premium": str(premium), "high_water": str(premium),
-            "partial_qty": str(partial_qty), "trail_qty": str(trail_qty), "atr": str(atr_val), "status": "PLACED"
-        })
-        r.expire(f"position:{order_id}", 86400)
-
-        k_cap=daily_key("capital_used"); r.incrbyfloat(k_cap,premium*qty); r.expire(k_cap,86400)
-        daily_incr("trade_count")
-        AuditLog.trade(order_id,tok.get("signal",""),qty,premium,sl_price,"PLACED")
-
-        return {"status": "SUCCESS", "order_id": order_id, "sl_price": sl_price}
-
-    except ValueError:
-        r.delete(lock_key); raise
-    except Exception as e:
-        AuditLog.error("PLACE_ORDER_FAILED", str(e))
-        r.delete(lock_key); raise ValueError(f"EXECUTION_ERROR: {str(e)}")
-
-# NEW: EXIT SIGNAL LOGIC
-@pipeline_guard
-def process_exit_signal(client, token_id: str) -> dict:
-    pos_keys = r.keys("position:*")
-    target_k = None; target_pos = None
-    for k in pos_keys:
-        p = r.hgetall(k)
-        if p.get("opt_token") == token_id and p.get("status") == "PLACED":
-            target_k = k; target_pos = p; break
-            
-    if not target_pos: raise ValueError("NO_ACTIVE_POSITION_FOR_EXIT")
-
-    # 1. Cancel Pending SL
-    try: client.cancelOrder(order_id=target_pos["sl_order_id"], variety="STOPLOSS")
-    except: pass 
-
-    # 2. Place Market Sell
-    qty = int(float(target_pos["remaining_qty"]))
-    resp = client.placeOrder({
-        "variety": "NORMAL", "tradingsymbol": target_pos["symbol"],
-        "symboltoken": target_pos["opt_token"], "transactiontype": "SELL",
-        "exchange": "NFO", "ordertype": "MARKET", "quantity": qty, "producttype": "INTRADAY"
-    })
-    
-    r.hset(target_k, mapping={"status": "CLOSED", "remaining_qty": "0"})
-    AuditLog.trade(resp["data"]["orderid"], "EXIT_SIGNAL", qty, 0, 0, "CLOSED")
-    return {"status": "SUCCESS", "exit_order_id": resp["data"]["orderid"]}
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 13 — BACKGROUND TASKS (TSL & EOD MONITOR)
-# ══════════════════════════════════════════════════════════════════
-def manage_trailing_sl(client):
-    """Automatically trail SL upwards as LTP increases"""
-    pos_keys = r.keys("position:*")
-    for k in pos_keys:
-        pos = r.hgetall(k)
-        if not pos or pos.get("status") != "PLACED": continue
+    async def send(self, text: str, reply_markup=None) -> None:
+        if not self._bot or not self._chat_id:
+            logger.info("[TG] %s", text)
+            return
         try:
-            ltp_info = fetch_ltp_with_retry(client, "NFO", pos["symbol"], pos["opt_token"])
-            ltp = ltp_info["ltp"]; hw = float(pos.get("high_water", pos["entry_price"]))
-            
-            if ltp > hw:
-                r.hset(k, mapping={"high_water": str(ltp)})
-                sl_pct = float(pos.get("sl_pct", 30.0))
-                # New SL based on Highest LTP
-                new_sl_raw = ltp * (1 - (sl_pct / 100))
-                new_sl = round_to_tick(new_sl_raw)
-                current_sl = float(pos.get("current_sl", 0))
+            await self._bot.send_message(
+                chat_id=self._chat_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:
+            logger.error("Telegram send failed: %s", exc)
 
-                # Trail UP only if difference is significant (e.g., > 10 ticks to avoid API spam)
-                if new_sl > current_sl + (TICK_SIZE * 10):
-                    client.modifyOrder({
-                        "orderid": pos["sl_order_id"], "variety": "STOPLOSS", "tradingsymbol": pos["symbol"],
-                        "symboltoken": pos["opt_token"], "exchange": "NFO", "ordertype": "STOPLOSS_MARKET", "triggerprice": str(new_sl)
-                    })
-                    r.hset(k, mapping={"current_sl": str(new_sl)})
-                    AuditLog.trade(k.split(":")[-1], "TRAIL_SL", int(pos["remaining_qty"]), ltp, new_sl, "MODIFIED")
-        except Exception as e:
-            pass # Ignore minor API timeouts during monitoring
+    async def alert_error(self, component: str, error: str) -> None:
+        await self.send(f"🚨 *ERROR* — `{component}`\n`{error}`")
 
-async def background_monitor():
-    """Runs forever in the background checking TSL and 2:25 EOD"""
-    while True:
-        try:
-            now_ms = int(time.time() * 1000)
-            client = get_angel_client()
 
-            # 1. EOD Square Off Check (At exactly 2:25 PM)
-            if should_square_off_now(now_ms):
-                if not r.get(f"eod_done_{today_ist()}"):
-                    pos_keys = r.keys("position:*")
-                    active_positions = [r.hgetall(k) for k in pos_keys if r.hgetall(k).get("status") == "PLACED"]
-                    if active_positions:
-                        results = eod_square_off(client, active_positions, now_ms)
-                        for k in pos_keys:
-                            if r.hgetall(k).get("status") == "PLACED":
-                                r.hset(k, mapping={"status": "CLOSED_EOD", "remaining_qty": "0"})
-                    r.setex(f"eod_done_{today_ist()}", 86400, "1")
+# ──────────────────────────────────────────────────────────────────────────────
+# Core Trading Engine
+# ──────────────────────────────────────────────────────────────────────────────
 
-            # 2. TSL Check (If market is open and EOD not triggered)
-            if is_market_open(now_ms) and not r.get(f"eod_done_{today_ist()}"):
-                manage_trailing_sl(client)
+class TradingEngine:
+    """
+    Central async engine. Responsibilities:
+      - Manage WebSocket tick feed (with exponential backoff reconnect)
+      - Run Alpha strategy on each tick/candle
+      - Fire orders within 100ms of signal
+      - Manage trailing SL
+      - Daily P&L kill-switch
+      - State persistence
+    """
 
-        except Exception as e:
-            AuditLog.error("BACKGROUND_MONITOR", str(e))
-            
-        await asyncio.sleep(5) # Runs every 5 seconds
+    WS_RETRY_BASE = 2.0       # seconds base for exponential backoff
+    WS_RETRY_MAX  = 60.0      # maximum backoff cap (seconds)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 14 — FASTAPI ROUTING
-# ══════════════════════════════════════════════════════════════════
-@app.on_event("startup")
-async def startup_event():
-    """Start the TSL and EOD monitor when FastAPI starts"""
-    asyncio.create_task(background_monitor())
+    def __init__(self) -> None:
+        self.angel      = AngelClient()
+        self.tg         = TelegramNotifier(Cfg.TELEGRAM_TOKEN, Cfg.TELEGRAM_CHAT_ID)
+        self.state      = StateStore(Cfg.STATE_FILE)
+        self.strategy   = AlphaStrategy()
+        self.indicators: Dict[str, IndicatorEngine] = {}   # keyed by token
+        self._scrip_rows: List[Dict] = []
+        self._spot_ltp: Dict[str, float] = {}              # underlying -> ltp
+        self._option_ltp: Dict[str, float] = {}            # token -> ltp
+        self._ws_retry_count = 0
+        self._running = False
+        self._trade_armed = False      # user confirmed real/paper trade
+        self._trade_mode_confirmed = Cfg.TRADE_MODE   # set by /starttrade command
+        self._ws: Optional[SmartWebSocketV2] = None
+        self._subscribed_tokens: set[str] = set()
+        self._trailing: Optional[TrailingState] = None
+        self._vix: float = 15.0
+        self._ad_ratio: float = 1.0
+        self._last_pct_notify: Dict[str, float] = {}  # token -> last notified price
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-@app.get("/")
-async def root():
-    return {"status": "Algo_Live_v6_Production", "time": _now_ist().strftime("%Y-%m-%d %H:%M:%S")}
+    # ── Startup ──────────────────────────────────────────────────────────────
 
-@app.post("/webhook")
-async def handle_webhook(request: Request):
-    try:
-        data = await request.json()
-        now_ms = int(time.time() * 1000)
-        
-        # 1. Validate Webhook (Handles both Entry and Exit paths)
-        validation = validate_webhook(data, now_ms)
-        
-        token_id = data.get("token", str(now_ms)) # Fallback to now_ms if token missing
-        
-        # 2. Setup Client
-        client = get_angel_client()
-        
-        # 3. Route to EXIT or ENTRY Logic
-        if validation.get("is_exit"):
-            result = process_exit_signal(client, token_id)
-            return {"status": "success", "action": "EXIT", "execution": result}
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._running = True
+
+        logger.info("🚀 Trading Engine starting — mode=%s underlying=%s",
+                    Cfg.TRADE_MODE, Cfg.UNDERLYING)
+
+        # Angel One login (skip in paper-no-creds mode)
+        if Cfg.API_KEY:
+            ok = await asyncio.get_event_loop().run_in_executor(None, self.angel.login)
+            if not ok and Cfg.TRADE_MODE == "live":
+                raise RuntimeError("Angel One login failed for LIVE mode")
         else:
-            lots = 1
-            if not r.hgetall(f"token:{token_id}"):
-                r.hset(f"token:{token_id}", mapping={
-                    "symbol": data.get("symbol", "UNKNOWN"), "opt_token": data.get("token", "UNKNOWN"),
-                    "signal": data.get("signal", "UNKNOWN"), "lot_mult": str(validation.get("lot_mult", 1.0)),
-                    "atr": "0", "expiry": str(now_ms + 60000)
-                })
-            result = place_order(client, lots, token_id)
-            return {"status": "success", "action": "ENTRY", "execution": result}
-            
-    except ValueError as ve: return {"status": "rejected", "reason": str(ve)}
-    except Exception as e: return {"status": "error", "message": str(e)}
+            logger.warning("No API_KEY — running in paper-only simulation mode")
+
+        # Load instrument master
+        try:
+            self._scrip_rows = await fetch_scrip_master()
+            logger.info("Scrip master loaded (%d instruments)", len(self._scrip_rows))
+        except Exception as exc:
+            await self.tg.alert_error("SCRIP_MASTER", str(exc))
+            logger.error("Scrip master failed: %s", exc)
+
+        # Notify Telegram
+        await self.tg.send(
+            f"🤖 *Ultra-Fast Algo Bot Started*\n"
+            f"Mode: `{Cfg.TRADE_MODE.upper()}`\n"
+            f"Underlying: `{Cfg.UNDERLYING}`\n"
+            f"Capital: ₹{Cfg.CAPITAL:,.0f} | MaxLoss: ₹{Cfg.MAX_DAILY_LOSS:,.0f}\n"
+            f"Target: ₹{Cfg.DAILY_TARGET:,.0f} | Lot: {Cfg.LOT_SIZE}\n"
+            f"Time: `{_now_label()}`"
+        )
+
+        # Resume active trade if restarted
+        if self.state.active_trade:
+            self._trailing = self.state.active_trade.trail()
+            await self.tg.send(
+                f"♻️ *Resumed active trade from previous session*\n"
+                f"Symbol: `{self.state.active_trade.symbol}`\n"
+                f"Entry: ₹{self.state.active_trade.entry_price:.2f} "
+                f"SL: ₹{self.state.active_trade.sl_price:.2f}"
+            )
+
+        # Run WebSocket feed loop
+        asyncio.create_task(self._ws_loop())
+        # Run background maintenance loop
+        asyncio.create_task(self._maintenance_loop())
+
+    # ── WebSocket feed with exponential backoff ───────────────────────────────
+
+    async def _ws_loop(self) -> None:
+        while self._running:
+            try:
+                await self._connect_ws()
+                self._ws_retry_count = 0
+            except Exception as exc:
+                self._ws_retry_count += 1
+                delay = min(
+                    self.WS_RETRY_MAX,
+                    self.WS_RETRY_BASE * (2 ** (self._ws_retry_count - 1)),
+                )
+                logger.warning("WebSocket error (attempt %d): %s — retrying in %.1fs",
+                               self._ws_retry_count, exc, delay)
+                await self.tg.send(
+                    f"⚠️ WS reconnecting in {delay:.0f}s (attempt {self._ws_retry_count})"
+                )
+                await asyncio.sleep(delay)
+                # Refresh session before reconnect
+                if Cfg.API_KEY:
+                    await self._loop.run_in_executor(None, self.angel.login)  # type: ignore[union-attr]
+
+    async def _connect_ws(self) -> None:
+        if not self.angel.auth_token:
+            await asyncio.sleep(5)
+            return
+
+        spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING)
+        tokens_to_sub = [{"exchangeType": 1, "tokens": [spot_token]}] if spot_token else []
+
+        loop = asyncio.get_running_loop()
+
+        def on_open(wsapp):
+            logger.info("WebSocket connected ✅")
+            if tokens_to_sub:
+                wsapp.subscribe("bot1", 3, tokens_to_sub)   # mode 3 = QUOTE
+
+        def on_data(_wsapp, message):
+            loop.call_soon_threadsafe(
+                asyncio.create_task, self._on_tick_raw(message)
+            )
+
+        def on_error(_wsapp, error):
+            logger.error("WS error: %s", error)
+
+        def on_close(_wsapp, code, msg):
+            logger.warning("WS closed: %s %s", code, msg)
+
+        self._ws = SmartWebSocketV2(
+            self.angel.auth_token,
+            Cfg.API_KEY,
+            Cfg.CLIENT_ID,
+            self.angel.feed_token,
+        )
+        self._ws.on_open = on_open
+        self._ws.on_data = on_data
+        self._ws.on_error = on_error
+        self._ws.on_close = on_close
+
+        await loop.run_in_executor(None, self._ws.connect)
+
+    # ── Tick processing ───────────────────────────────────────────────────────
+
+    async def _on_tick_raw(self, message: Any) -> None:
+        """Deserialize WebSocket tick and route to strategy."""
+        t_start = time.monotonic()
+        try:
+            if isinstance(message, (bytes, bytearray)):
+                import struct
+                # SmartWebSocketV2 sends binary-encoded ticks
+                data = self._parse_binary_tick(message)
+            elif isinstance(message, dict):
+                data = message
+            else:
+                return
+
+            token = str(data.get("token", ""))
+            ltp   = float(data.get("last_traded_price", data.get("ltp", 0)) or 0) / 100.0
+            vol   = int(data.get("volume_trade_for_the_day", data.get("volume", 0)) or 0)
+            ts_ms = int(data.get("exchange_timestamp", time.time() * 1000) or time.time() * 1000)
+
+            if ltp <= 0:
+                return
+
+            tick = Tick(token=token, ltp=ltp, volume=vol, timestamp_ms=ts_ms)
+            await self._process_tick(tick, t_start)
+
+        except Exception as exc:
+            logger.debug("Tick parse error: %s", exc)
+
+    def _parse_binary_tick(self, data: bytes) -> Dict[str, Any]:
+        """
+        Parse Angel One binary WebSocket message.
+        See Angel One SmartAPI WebSocket documentation for format.
+        """
+        try:
+            # Mode 3 (QUOTE): subscription_mode(1) + exchange_type(1) + token(25) +
+            #   seq_no(8) + exchange_ts(8) + ltp(8) + ... (all ints, big-endian)
+            if len(data) < 51:
+                return {}
+            token_raw = data[2:27].decode("utf-8").strip("\x00")
+            ltp_raw   = int.from_bytes(data[43:51], "big")   # int64 paise
+            vol = 0
+            if len(data) >= 67:
+                vol = int.from_bytes(data[59:67], "big")
+            ts_ms = int(time.time() * 1000)
+            return {"token": token_raw, "last_traded_price": ltp_raw, "volume": vol,
+                    "exchange_timestamp": ts_ms}
+        except Exception:
+            return {}
+
+    async def _process_tick(self, tick: Tick, t_start: float) -> None:
+        """Strategy evaluation & order firing within 100ms."""
+        token = tick.token
+        ltp   = tick.ltp
+
+        # Update spot price map (underlying index)
+        spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+        if token == spot_token:
+            self._spot_ltp[Cfg.UNDERLYING] = ltp
+
+        # Update option LTP if we have a trade
+        if self.state.active_trade and token == self.state.active_trade.token:
+            self._option_ltp[token] = ltp
+            # 1% price move notification
+            await self._maybe_notify_price_move(token, ltp)
+            # Trailing SL management
+            await self._manage_trailing(ltp)
+
+        # Strategy evaluation only on underlying ticks
+        if token != spot_token:
+            return
+
+        # Skip if not in trading hours or daily block
+        if not _is_trading_hours() or self.state.day_blocked():
+            return
+
+        # Skip if already in a trade
+        if self.state.active_trade:
+            return
+
+        # Strategy must be armed by user
+        if not self._trade_armed:
+            return
+
+        # Build / update indicator
+        if token not in self.indicators:
+            self.indicators[token] = IndicatorEngine()
+        ind = self.indicators[token]
+        completed_candle = ind.on_tick(tick)
+
+        # Evaluate only when a new 5-min candle closes (or on every tick if no candle yet)
+        current_vol = float(tick.volume)
+        result: SignalResult = self.strategy.evaluate(ltp, ind, current_vol)
+
+        if result.signal in ("CALL", "PUT"):
+            elapsed_ms = (time.monotonic() - t_start) * 1000
+            logger.info(
+                "🎯 Signal %s | RSI=%.1f | ST=%s | Spike=%s | eval=%.1fms",
+                result.signal, result.rsi, result.supertrend_dir,
+                result.volume_spike, elapsed_ms,
+            )
+            await self._fire_order(result, ltp)
+
+    # ── Order execution ───────────────────────────────────────────────────────
+
+    async def _fire_order(self, signal: SignalResult, spot_ltp: float) -> None:
+        """Find ATM option and place BUY order within 100ms of signal."""
+        t0 = time.monotonic()
+        try:
+            option_type = "CE" if signal.signal == "CALL" else "PE"
+            today = datetime.now(IST).strftime("%Y-%m-%d")
+
+            # Find ATM contract
+            row = find_atm_option(
+                self._scrip_rows, Cfg.UNDERLYING, spot_ltp, option_type, today,
+            )
+            symbol = str(row["symbol"])
+            token  = str(row["token"])
+            raw_lot_size = int(float(row.get("lotsize") or _lot_qty(Cfg.UNDERLYING)))
+            qty = Cfg.LOT_SIZE * raw_lot_size
+
+            # Get option LTP
+            if Cfg.TRADE_MODE == "live" and Cfg.API_KEY:
+                loop = asyncio.get_running_loop()
+                opt_ltp = await loop.run_in_executor(
+                    None, lambda: self.angel.get_ltp("NFO", symbol, token)
+                )
+            else:
+                opt_ltp = spot_ltp * 0.01   # paper simulation ~1% of index
+
+            if opt_ltp <= 0:
+                logger.warning("Option LTP unavailable for %s", symbol)
+                return
+
+            order_id = await place_limit_order_async(
+                self.angel, symbol, token, qty, "BUY", opt_ltp
+            )
+
+            sl = _sl_price(opt_ltp, option_type)
+            trade = ActiveTrade(
+                order_id=order_id,
+                symbol=symbol,
+                token=token,
+                option_type=option_type,
+                lot_size=Cfg.LOT_SIZE,
+                entry_price=opt_ltp,
+                sl_price=sl,
+                entry_time=datetime.now(IST).isoformat(),
+                mode=self._trade_mode_confirmed,
+            )
+            self.state.active_trade = trade
+            self._trailing = TrailingState(
+                entry_price=opt_ltp,
+                current_sl=sl,
+                high_water=opt_ltp,
+                lot_size=qty,
+            )
+            await self.state.save()
+
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            logger.info("✅ Order fired in %.1fms", elapsed_ms)
+
+            await self.tg.send(
+                f"✅ *ORDER PLACED* — `{signal.signal}`\n"
+                f"Symbol: `{symbol}`\n"
+                f"Qty: {qty} | Entry: ₹{opt_ltp:.2f} | SL: ₹{sl:.2f}\n"
+                f"Reason: {signal.reason}\n"
+                f"⚡ Fired in *{elapsed_ms:.1f}ms*"
+            )
+
+        except Exception as exc:
+            logger.error("Order fire failed: %s", exc)
+            await self.tg.alert_error("ORDER_FIRE", str(exc))
+
+    # ── Trailing SL management ────────────────────────────────────────────────
+
+    async def _manage_trailing(self, ltp: float) -> None:
+        if not self._trailing or not self.state.active_trade:
+            return
+        trade = self.state.active_trade
+        changed, new_sl = self._trailing.update(ltp)
+
+        if changed:
+            trade.sl_price = new_sl
+            await self.state.save()
+            pnl = self._trailing.unrealised_pnl(ltp)
+            be_tag = " 🔒 Breakeven" if self._trailing.is_breakeven else ""
+            await self.tg.send(
+                f"📈 *SL TRAILED*{be_tag}\n"
+                f"`{trade.symbol}` LTP=₹{ltp:.2f}\n"
+                f"New SL: ₹{new_sl:.2f} | Unrealised P&L: ₹{pnl:.0f}"
+            )
+
+        # Hard SL hit
+        if ltp <= trade.sl_price:
+            await self._exit_trade(ltp, reason="STOP_LOSS_HIT")
+
+    async def _exit_trade(self, ltp: float, reason: str = "SIGNAL_EXIT") -> None:
+        if not self.state.active_trade:
+            return
+        trade = self.state.active_trade
+        qty = trade.lot_size * _lot_qty(trade.symbol)
+
+        try:
+            eid = await place_limit_order_async(
+                self.angel, trade.symbol, trade.token, qty, "SELL", ltp
+            )
+        except Exception as exc:
+            logger.error("Exit order failed: %s", exc)
+            await self.tg.alert_error("EXIT_ORDER", str(exc))
+            return
+
+        pnl = round((ltp - trade.entry_price) * qty, 2)
+        self.state.record_closed_trade(pnl)
+        self._trailing = None
+        await self.state.save()
+
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        await self.tg.send(
+            f"{emoji} *TRADE CLOSED* — {reason}\n"
+            f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
+            f"Entry: ₹{trade.entry_price:.2f} | P&L: ₹{pnl:+.0f}\n"
+            f"Daily P&L: ₹{self.state.daily_pnl:+.0f}"
+        )
+
+        # Kill switch
+        if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
+            await self.tg.send(
+                "🛑 *DAILY LOSS LIMIT REACHED* — Bot stopping for the day.\n"
+                f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+            )
+            logger.critical("Daily loss limit hit. Bot shutting down for today.")
+            self._trade_armed = False
+
+    # ── 1% price move notifications ───────────────────────────────────────────
+
+    async def _maybe_notify_price_move(self, token: str, ltp: float) -> None:
+        last = self._last_pct_notify.get(token, ltp)
+        if last <= 0:
+            self._last_pct_notify[token] = ltp
+            return
+        pct = abs((ltp - last) / last) * 100
+        if pct >= 1.0:
+            self._last_pct_notify[token] = ltp
+            direction = "📈" if ltp > last else "📉"
+            await self.tg.send(
+                f"{direction} *1% Price Move* — `{token}`\n"
+                f"₹{last:.2f} → ₹{ltp:.2f} ({pct:+.1f}%)"
+            )
+
+    # ── Background maintenance ────────────────────────────────────────────────
+
+    async def _maintenance_loop(self) -> None:
+        """Periodic session refresh, EOD square-off, state save."""
+        while self._running:
+            try:
+                hhmm = _hhmm()
+
+                # EOD square off at 14:25
+                if hhmm == 1425 and self.state.active_trade:
+                    loop = asyncio.get_running_loop()
+                    ltp = 0.0
+                    if Cfg.API_KEY:
+                        t = self.state.active_trade
+                        ltp = await loop.run_in_executor(
+                            None, lambda: self.angel.get_ltp("NFO", t.symbol, t.token)
+                        )
+                    await self._exit_trade(ltp or self.state.active_trade.entry_price,
+                                           reason="EOD_SQUARE_OFF")
+
+                # Periodic state persistence
+                await self.state.save()
+
+            except Exception as exc:
+                logger.error("Maintenance loop error: %s", exc)
+                await self.tg.alert_error("MAINTENANCE", str(exc))
+
+            await asyncio.sleep(30)
+
+    # ── Telegram command handlers ─────────────────────────────────────────────
+
+    async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        loop = asyncio.get_running_loop()
+        balance = 0.0
+        if Cfg.API_KEY:
+            balance = await loop.run_in_executor(None, self.angel.get_funds)
+        mhi = market_health_index(self._vix, self._ad_ratio)
+        trade_info = "None"
+        if self.state.active_trade:
+            t = self.state.active_trade
+            opt_ltp = self._option_ltp.get(t.token, t.entry_price)
+            unreal = round((opt_ltp - t.entry_price) * t.lot_size * _lot_qty(t.symbol), 2)
+            trade_info = (
+                f"`{t.symbol}` Entry=₹{t.entry_price:.2f} "
+                f"SL=₹{t.sl_price:.2f} Unreal=₹{unreal:+.0f}"
+            )
+        msg = (
+            f"📊 *Bot Status* — `{_now_label()}`\n"
+            f"Balance: ₹{balance:,.0f}\n"
+            f"Today P&L: ₹{self.state.daily_pnl:+.0f}\n"
+            f"Trades today: {self.state.trade_count}\n"
+            f"Active Trade: {trade_info}\n"
+            f"Armed: {'✅' if self._trade_armed else '❌'}\n"
+            f"Market Health: {mhi['label']} (score={mhi['score']})\n"
+            f"VIX: {self._vix:.1f} | A-D: {self._ad_ratio:.2f}"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def cmd_check_strategy(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        spot = self._spot_ltp.get(Cfg.UNDERLYING, 0)
+        token = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+        ind = self.indicators.get(token)
+        if not ind or ind.num_candles < 5 or spot <= 0:
+            await update.message.reply_text(
+                "⏳ *Warming up* — need at least 5 candles of data. Wait a few minutes.",
+                parse_mode="Markdown",
+            )
+            return
+        result = self.strategy.evaluate(spot, ind, float(ind.candles[-1].volume if ind.candles else 0))
+        if result.signal in ("CALL", "PUT"):
+            label = "✅ *Strong Signal Found!*"
+        else:
+            label = "❌ *Market Unstable — Avoid*"
+        msg = (
+            f"{label}\n"
+            f"Signal: `{result.signal}` | Strength: {result.strength}%\n"
+            f"Supertrend: `{result.supertrend_dir}` | VWAP: {'above' if result.above_vwap else 'below'}\n"
+            f"RSI: {result.rsi:.1f} | VolSpike: {'✅' if result.volume_spike else '❌'}\n"
+            f"Reason: _{result.reason}_"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def cmd_start_trade(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        keyboard = [
+            [
+                InlineKeyboardButton("📄 Paper Trade", callback_data="confirm_paper"),
+                InlineKeyboardButton("💰 Real Trade", callback_data="confirm_live"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_trade")],
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "⚠️ *Choose trading mode*\n\n"
+            "Paper = simulated, no real money\n"
+            "Real = live orders on Angel One",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+    async def callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+
+        if data == "confirm_paper":
+            self._trade_mode_confirmed = "paper"
+            self._trade_armed = True
+            await query.edit_message_text(
+                "✅ *Paper trading armed.* Bot will simulate entries.",
+                parse_mode="Markdown",
+            )
+        elif data == "confirm_live":
+            if not Cfg.API_KEY:
+                await query.edit_message_text(
+                    "❌ Cannot start LIVE trade — API_KEY not configured.",
+                    parse_mode="Markdown",
+                )
+                return
+            self._trade_mode_confirmed = "live"
+            self._trade_armed = True
+            await query.edit_message_text(
+                "🚨 *LIVE trading armed.* Real orders will be placed on Angel One.",
+                parse_mode="Markdown",
+            )
+        elif data == "cancel_trade":
+            self._trade_armed = False
+            await query.edit_message_text("❌ Trade start cancelled.")
+
+    async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        self._trade_armed = False
+        await update.message.reply_text(
+            "🛑 *Bot disarmed.* No new trades will be placed.\n"
+            "Active trade (if any) continues to trail SL.",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_exit_now(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.state.active_trade:
+            await update.message.reply_text("No active trade to exit.")
+            return
+        t = self.state.active_trade
+        loop = asyncio.get_running_loop()
+        ltp = self._option_ltp.get(t.token, t.entry_price)
+        if Cfg.API_KEY and ltp == t.entry_price:
+            ltp = await loop.run_in_executor(
+                None, lambda: self.angel.get_ltp("NFO", t.symbol, t.token)
+            )
+        await self._exit_trade(ltp, reason="MANUAL_EXIT")
+        await update.message.reply_text("✅ Manual exit initiated.")
+
+    async def cmd_setvix(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = ctx.args or []
+        if not args:
+            await update.message.reply_text("Usage: /setvix <value>  e.g. /setvix 14.5")
+            return
+        try:
+            self._vix = float(args[0])
+            await update.message.reply_text(f"VIX updated to {self._vix:.2f}")
+        except ValueError:
+            await update.message.reply_text("Invalid VIX value")
+
+    async def cmd_setad(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = ctx.args or []
+        if not args:
+            await update.message.reply_text("Usage: /setad <ratio>  e.g. /setad 1.8")
+            return
+        try:
+            self._ad_ratio = float(args[0])
+            await update.message.reply_text(f"A-D ratio updated to {self._ad_ratio:.2f}")
+        except ValueError:
+            await update.message.reply_text("Invalid A-D ratio")
+
+    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        help_text = (
+            "🤖 *Ultra-Fast Algo Bot Commands*\n\n"
+            "/status — Balance, P&L, Market Health Index\n"
+            "/checkstrategy — Analyze current setup\n"
+            "/starttrade — Choose Paper or Real mode\n"
+            "/stop — Disarm bot (no new trades)\n"
+            "/exitnow — Force exit active trade\n"
+            "/setvix <val> — Update VIX manually\n"
+            "/setad <val> — Update Advance-Decline ratio\n"
+            "/help — Show this message"
+        )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram Application builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_telegram_app(engine: TradingEngine) -> Optional[Application]:
+    if not Cfg.TELEGRAM_TOKEN:
+        logger.warning("No TELEGRAM_TOKEN — Telegram commands disabled")
+        return None
+
+    app = Application.builder().token(Cfg.TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("status",        engine.cmd_status))
+    app.add_handler(CommandHandler("checkstrategy", engine.cmd_check_strategy))
+    app.add_handler(CommandHandler("starttrade",    engine.cmd_start_trade))
+    app.add_handler(CommandHandler("stop",          engine.cmd_stop))
+    app.add_handler(CommandHandler("exitnow",       engine.cmd_exit_now))
+    app.add_handler(CommandHandler("setvix",        engine.cmd_setvix))
+    app.add_handler(CommandHandler("setad",         engine.cmd_setad))
+    app.add_handler(CommandHandler("help",          engine.cmd_help))
+    app.add_handler(CallbackQueryHandler(engine.callback_handler))
+    return app
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _async_main() -> None:
+    engine = TradingEngine()
+    await engine.start()
+
+    tg_app = build_telegram_app(engine)
+    if tg_app:
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("Telegram polling started")
+
+    # Keep alive
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        engine._running = False
+        if tg_app:
+            await tg_app.updater.stop()
+            await tg_app.stop()
+            await tg_app.shutdown()
+        await engine.state.save()
+        logger.info("Bot shut down gracefully.")
+
+
+def main() -> None:
+    # Graceful shutdown on SIGTERM (Railway sends this)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _shutdown():
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _shutdown)
+        except NotImplementedError:
+            pass   # Windows
+
+    try:
+        loop.run_until_complete(_async_main())
+    finally:
+        loop.close()
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()
