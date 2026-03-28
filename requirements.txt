@@ -6,3 +6,4 @@ pycryptodome==3.23.0
 websocket-client==1.8.0
 redis==5.2.1
 logzero==1.7.0
+structlog==24.4.0
