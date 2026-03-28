@@ -897,7 +897,7 @@ def find_atm_option(rows: List[Dict], underlying: str, spot: float,
 
 async def place_limit_order(angel: AngelClient, symbol: str, token: str,
                              qty: int, action: str, ltp: float,
-                             buffer: float = -1.0) -> str:
+                             buffer: float = -1.0, trade_mode: str = "paper") -> str:
     if buffer < 0:
         buffer = Cfg.SLIPPAGE_BUFFER
     price  = _round_tick(ltp + buffer if action == "BUY" else ltp - buffer)
@@ -907,7 +907,7 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
         "producttype": "INTRADAY", "duration": "IOC",
         "quantity": str(qty), "price": str(price),
     }
-    if Cfg.TRADE_MODE == "paper":
+    if trade_mode == "paper":
         sim_id = f"PAPER_{int(time.time() * 1000)}"
         logger.info("[PAPER] %s %s qty=%d @%.2f", action, symbol, qty, price)
         return sim_id
@@ -1110,6 +1110,13 @@ class TradingEngine:
             t_start = time.monotonic()
             await self._process_tick_demo(tick, t_start)
 
+            # 🎟️ Emulate Option Tick dynamically if active
+            if self.state.active_trade:
+                opt = self.state.active_trade
+                opt_tick = Tick(token=opt.token, ltp=round(self._sim_price * 0.01 + rng.uniform(-2, 2), 2),
+                                volume=10, timestamp_ms=ts_ms)
+                await self._process_tick_demo(opt_tick, t_start)
+
             # ── Status update every 12 ticks (one simulated candle) ────────────
             if tick_count % CANDLE_TICKS == 0:
                 self._sim_candle_count += 1
@@ -1250,8 +1257,6 @@ class TradingEngine:
     def _parse_tick(self, message: Any) -> Optional[Dict[str, Any]]:
         if isinstance(message, dict):
             ltp = float(message.get("last_traded_price", message.get("ltp", 0)) or 0)
-            if ltp > 100:        # Angel sends paise for binary ticks
-                ltp /= 100.0
             return {
                 "token":  str(message.get("token", "")),
                 "ltp":    ltp,
@@ -1353,7 +1358,7 @@ class TradingEngine:
                 logger.warning("Option LTP 0 for %s — skipping", symbol)
                 return
 
-            order_id = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp)
+            order_id = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed)
             sl       = _sl_price_dynamic(opt_ltp, atr=signal.entry_atr)
 
             trade = ActiveTrade(
@@ -1369,6 +1374,19 @@ class TradingEngine:
                 high_water=opt_ltp, lot_size=qty,
             )
             await self.state.save()
+
+            # 📡 Subscribe Option Token
+            if self._ws:
+                try:
+                    req = {
+                        "correlationID": "opt_track",
+                        "action": 1,
+                        "params": {"mode": 1, "tokenList": [{"exchangeType": 2, "tokens": [SPOT_TOKEN.get(Cfg.UNDERLYING, ""), token]}]}
+                    }
+                    self._ws.send(json.dumps(req))
+                    logger.info("📡 Live WS Subscribed to Option Token: %s", token)
+                except Exception as wse:
+                    logger.warning("Failed to subscribe option token %s: %s", token, wse)
 
             elapsed = (time.monotonic() - t0) * 1000
             logger.info("✅ Order in %.1fms", elapsed)
@@ -1427,10 +1445,23 @@ class TradingEngine:
         trade = self.state.active_trade
         qty   = trade.lot_size * _lot_qty(trade.symbol)
         try:
-            await place_limit_order(self.angel, trade.symbol, trade.token, qty, "SELL", ltp)
+            await place_limit_order(self.angel, trade.symbol, trade.token, qty, "SELL", ltp, trade_mode=trade.mode)
         except Exception as exc:
             await self.tg.alert_error("EXIT_ORDER", str(exc))
             return
+            
+        # 📡 Unsubscribe Option Token
+        if self._ws:
+            try:
+                req = {
+                    "correlationID": "spot_only",
+                    "action": 1,
+                    "params": {"mode": 1, "tokenList": [{"exchangeType": 2, "tokens": [SPOT_TOKEN.get(Cfg.UNDERLYING, "")]}]}
+                }
+                self._ws.send(json.dumps(req))
+                logger.info("📡 Live WS Reverted to Spot only.")
+            except Exception as wse:
+                pass
 
     async def _check_smart_exit(self, spot_ltp: float, ind: IndicatorEngine) -> None:
         """Hybrid Early Exit: Reversal Pattern + Price breaking EMA9."""
