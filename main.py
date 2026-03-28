@@ -785,6 +785,7 @@ class TradingEngine:
             )
 
         asyncio.create_task(self._maintenance_loop())
+        asyncio.create_task(self._auto_heal_loop())   # ← self-healing background task
 
         # Start simulation loop when no API key (demo mode)
         if self._demo_mode:
@@ -1170,6 +1171,141 @@ class TradingEngine:
                 logger.error("Maintenance error: %s", exc)
             await asyncio.sleep(30)
 
+    # ── Self-Healing System ───────────────────────────────────────────────────
+
+    async def _health_check_and_heal(self) -> dict:
+        """
+        6-point health diagnostic + auto-fix.
+        Returns a dict with check name → (status_emoji, description, fixed).
+        """
+        results: dict = {}
+
+        # ── 1. Proxy check ────────────────────────────────────────────────────
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+        if proxy:
+            # Ensure ALL_PROXY is also set (may have been cleared)
+            if not os.environ.get("ALL_PROXY"):
+                os.environ["ALL_PROXY"] = proxy
+                results["Proxy"] = ("🔧", f"ALL_PROXY re-set → {proxy.split('@')[-1]}", True)
+            else:
+                results["Proxy"] = ("✅", f"Static IP active: {proxy.split('@')[-1]}", False)
+        else:
+            results["Proxy"] = ("⚠️", "HTTP_PROXY not set in Railway vars!", False)
+
+        # ── 2. Telegram polling check ─────────────────────────────────────────
+        try:
+            me = await self.tg._bot.get_me() if self.tg._bot else None
+            if me:
+                results["Telegram"] = ("✅", f"Polling OK — @{me.username}", False)
+            else:
+                results["Telegram"] = ("❌", "Bot object missing", False)
+        except Exception as tg_err:
+            # Try to recover: delete webhook
+            try:
+                if self.tg._bot:
+                    await self.tg._bot.delete_webhook(drop_pending_updates=True)
+                results["Telegram"] = ("🔧", f"Webhook cleared (was: {tg_err})", True)
+            except Exception:
+                results["Telegram"] = ("❌", str(tg_err)[:80], False)
+
+        # ── 3. AngelOne login / session check ─────────────────────────────────
+        if not Cfg.API_KEY:
+            results["AngelOne"] = ("ℹ️", "API_KEY not set — Demo mode", False)
+        else:
+            session_age_h = (time.time() - self.angel._login_time) / 3600
+            if session_age_h > 5.5 or not self.angel.auth_token:
+                # Re-login
+                try:
+                    ok = await asyncio.get_running_loop().run_in_executor(
+                        None, self.angel.login
+                    )
+                    if ok:
+                        results["AngelOne"] = ("🔧", f"Session refreshed (was {session_age_h:.1f}h old)", True)
+                    else:
+                        results["AngelOne"] = ("❌", "Re-login failed — check API_KEY/TOTP", False)
+                except Exception as ae:
+                    results["AngelOne"] = ("❌", str(ae)[:80], False)
+            else:
+                results["AngelOne"] = ("✅", f"Session valid ({session_age_h:.1f}h old)", False)
+
+        # ── 4. Scrip Master check ─────────────────────────────────────────────
+        if len(self._scrip_rows) > 10000:
+            results["ScripMaster"] = ("✅", f"{len(self._scrip_rows):,} instruments loaded", False)
+        else:
+            try:
+                self._scrip_rows = await fetch_scrip_master()
+                results["ScripMaster"] = ("🔧", f"Reloaded: {len(self._scrip_rows):,} instruments", True)
+            except Exception as se:
+                results["ScripMaster"] = ("❌", f"Reload failed: {se}", False)
+
+        # ── 5. WebSocket / tick feed check ────────────────────────────────────
+        if self._demo_mode:
+            results["TickFeed"] = ("ℹ️", "Demo simulation active (no WS needed)", False)
+        elif self._ws is not None:
+            results["TickFeed"] = ("✅", "WebSocket connected", False)
+        else:
+            results["TickFeed"] = ("⚠️", "WS not connected — will auto-reconnect", False)
+
+        # ── 6. State integrity check ───────────────────────────────────────────
+        try:
+            await self.state.save()
+            results["State"] = ("✅", f"P&L=₹{self.state.daily_pnl:+.0f}  Trades={self.state.trade_count}", False)
+        except Exception as ste:
+            results["State"] = ("❌", f"Save failed: {ste}", False)
+
+        return results
+
+    async def cmd_fix(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Telegram /fix — Full self-diagnostic + auto-heal."""
+        await update.message.reply_text(
+            "🔍 *Self-Diagnostic Running...*\n"
+            "6 components சோதிக்கிறோம், சற்று காத்திருங்கள்...",
+            parse_mode="Markdown",
+        )
+
+        try:
+            results = await self._health_check_and_heal()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Diagnostic failed: {e}")
+            return
+
+        fixed_count = sum(1 for (_, _, fixed) in results.values() if fixed)
+        errors      = sum(1 for (emoji, _, _) in results.values() if emoji == "❌")
+
+        lines = ["🛠️ *Self-Heal Report*\n"]
+        for name, (emoji, desc, fixed) in results.items():
+            tag = " _(fixed)_" if fixed else ""
+            lines.append(f"{emoji} *{name}*: {desc}{tag}")
+
+        if fixed_count > 0:
+            lines.append(f"\n✅ *{fixed_count} issue(s) auto-fixed!*")
+        if errors > 0:
+            lines.append(f"\n⚠️ *{errors} issue(s) need manual attention.*")
+        if fixed_count == 0 and errors == 0:
+            lines.append("\n🟢 *All systems healthy — no action needed!*")
+
+        lines.append(f"\n_Checked at {_now_label()}_")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def _auto_heal_loop(self) -> None:
+        """Background loop: silently self-heals every 5 minutes."""
+        await asyncio.sleep(300)  # first run after 5 min
+        while self._running:
+            try:
+                results = await self._health_check_and_heal()
+                fixed = [(n, d) for n, (e, d, f) in results.items() if f]
+                errors = [(n, d) for n, (e, d, f) in results.items() if e == "❌"]
+                if fixed:
+                    msg = "🔧 *Auto-Heal:* " + ", ".join(f"{n} fixed" for n, _ in fixed)
+                    await self.tg.send(msg)
+                    logger.info("Auto-heal fixed: %s", [n for n, _ in fixed])
+                if errors:
+                    msg = "⚠️ *Auto-Heal Alert:* " + ", ".join(f"{n}: {d[:40]}" for n, d in errors)
+                    await self.tg.send(msg)
+            except Exception as exc:
+                logger.warning("Auto-heal loop error: %s", exc)
+            await asyncio.sleep(300)  # every 5 minutes
+
     # ── Telegram commands ─────────────────────────────────────────────────────
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1306,6 +1442,7 @@ class TradingEngine:
             "/starttrade — Paper அல்லது Real trade தொடங்கு\n"
             "/stop — Bot disarm (new trades இல்லை)\n"
             "/exitnow — Active trade force exit\n"
+            "/fix — 🛠️ Self-diagnostic + auto-heal (6 checks)\n"
             "/setvix <val> — VIX manually set\n"
             "/setad <val> — Advance-Decline ratio set\n"
             "/help — இந்த list காட்டு",
@@ -1336,6 +1473,7 @@ def build_app(engine: TradingEngine) -> Optional[Application]:
     app.add_handler(CommandHandler("starttrade",    engine.cmd_starttrade))
     app.add_handler(CommandHandler("stop",          engine.cmd_stop))
     app.add_handler(CommandHandler("exitnow",       engine.cmd_exitnow))
+    app.add_handler(CommandHandler("fix",           engine.cmd_fix))
     app.add_handler(CommandHandler("setvix",        engine.cmd_setvix))
     app.add_handler(CommandHandler("setad",         engine.cmd_setad))
     app.add_handler(CommandHandler("help",          engine.cmd_help))
