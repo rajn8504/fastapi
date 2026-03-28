@@ -1186,7 +1186,12 @@ class TradingEngine:
             return
 
         spot_token  = SPOT_TOKEN.get(Cfg.UNDERLYING)
-        sub_payload = [{"exchangeType": 1, "tokens": [spot_token]}] if spot_token else []
+        sub_payload = []
+        if spot_token:
+            sub_payload.append({"exchangeType": 1, "tokens": [spot_token]})
+        if self.state.active_trade:
+            sub_payload.append({"exchangeType": 2, "tokens": [self.state.active_trade.token]})
+
         loop        = asyncio.get_running_loop()
 
         # ── Callback definitions ───────────────────────────────────────────────
@@ -1347,7 +1352,7 @@ class TradingEngine:
             raw_lot_sz  = int(float(row.get("lotsize") or _lot_qty(Cfg.UNDERLYING)))
             qty         = Cfg.LOT_SIZE * raw_lot_sz
 
-            if Cfg.TRADE_MODE == "live" and Cfg.API_KEY:
+            if self._trade_mode_confirmed == "live" and Cfg.API_KEY:
                 opt_ltp = await self._loop.run_in_executor(  # type: ignore[union-attr]
                     None, lambda: self.angel.get_ltp("NFO", symbol, token)
                 )
@@ -1378,12 +1383,11 @@ class TradingEngine:
             # 📡 Subscribe Option Token
             if self._ws:
                 try:
-                    req = {
-                        "correlationID": "opt_track",
-                        "action": 1,
-                        "params": {"mode": 1, "tokenList": [{"exchangeType": 2, "tokens": [SPOT_TOKEN.get(Cfg.UNDERLYING, ""), token]}]}
-                    }
-                    self._ws.send(json.dumps(req))
+                    spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                    sub_p = []
+                    if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
+                    sub_p.append({"exchangeType": 2, "tokens": [token]})
+                    self._ws.subscribe("bot_opt", 3, sub_p)
                     logger.info("📡 Live WS Subscribed to Option Token: %s", token)
                 except Exception as wse:
                     logger.warning("Failed to subscribe option token %s: %s", token, wse)
@@ -1453,15 +1457,32 @@ class TradingEngine:
         # 📡 Unsubscribe Option Token
         if self._ws:
             try:
-                req = {
-                    "correlationID": "spot_only",
-                    "action": 1,
-                    "params": {"mode": 1, "tokenList": [{"exchangeType": 2, "tokens": [SPOT_TOKEN.get(Cfg.UNDERLYING, "")]}]}
-                }
-                self._ws.send(json.dumps(req))
+                spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                sub_p = []
+                if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
+                self._ws.subscribe("bot_spot", 3, sub_p)
                 logger.info("📡 Live WS Reverted to Spot only.")
             except Exception as wse:
                 pass
+
+        # === 📉 Book-keeping Block ===
+        pnl = round((ltp - trade.entry_price) * qty, 2)
+        self.state.record_closed_trade(pnl)
+        self._trailing = None
+        await self.state.save()
+
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        await self.tg.send(
+            f"{emoji} *TRADE CLOSED* — {reason}\n"
+            f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
+            f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
+        )
+        if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
+            self._trade_armed = False
+            await self.tg.send(
+                "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
+                f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+            )
 
     async def _check_smart_exit(self, spot_ltp: float, ind: IndicatorEngine) -> None:
         """Hybrid Early Exit: Reversal Pattern + Price breaking EMA9."""
@@ -1485,24 +1506,6 @@ class TradingEngine:
                 logger.info("🧠 Smart Exit Triggered: PE reversal %s + EMA break", pattern)
                 await self.tg.send(f"🧠 *Smart Exit triggered!*\nPattern: `{pattern}`\nSecured P&L: ₹{pnl_unrealised:.0f}")
                 await self._exit_trade(act_ltp, "SMART_EXIT")
-
-        pnl = round((ltp - trade.entry_price) * qty, 2)
-        self.state.record_closed_trade(pnl)
-        self._trailing = None
-        await self.state.save()
-
-        emoji = "🟢" if pnl >= 0 else "🔴"
-        await self.tg.send(
-            f"{emoji} *TRADE CLOSED* — {reason}\n"
-            f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
-            f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
-        )
-        if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
-            self._trade_armed = False
-            await self.tg.send(
-                "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
-                f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
-            )
 
     async def _maybe_notify_price_move(self, token: str, ltp: float) -> None:
         last = self._last_pct_notify.get(token, ltp)
