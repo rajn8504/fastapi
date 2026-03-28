@@ -1110,14 +1110,22 @@ class TradingEngine:
             await asyncio.sleep(5)
             return
 
-        spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING)
+        spot_token  = SPOT_TOKEN.get(Cfg.UNDERLYING)
         sub_payload = [{"exchangeType": 1, "tokens": [spot_token]}] if spot_token else []
-        loop = asyncio.get_running_loop()
+        loop        = asyncio.get_running_loop()
+
+        # ── Callback definitions ───────────────────────────────────────────────
 
         def on_open(wsapp):
-            logger.info("WebSocket connected ✅")
-            if sub_payload:
-                wsapp.subscribe("bot1", 3, sub_payload)
+            logger.info("WebSocket connected ✅ — subscribing to %s", spot_token)
+            # BUG FIX: subscribe() is a method of SmartWebSocketV2, NOT wsapp.
+            # wsapp is the underlying websocket-client WebSocketApp object.
+            if sub_payload and self._ws:
+                try:
+                    self._ws.subscribe("bot1", 3, sub_payload)
+                    logger.info("📡 Subscribed to BankNifty feed (token=%s)", spot_token)
+                except Exception as sub_err:
+                    logger.error("Subscribe failed: %s", sub_err)
 
         def on_data(_wsapp, message):
             loop.call_soon_threadsafe(
@@ -1127,9 +1135,14 @@ class TradingEngine:
         def on_error(_wsapp, error):
             logger.error("WS error: %s", error)
 
-        def on_close(_wsapp, code=None, msg=None):
-            logger.warning("WS closed: %s %s", code, msg)
+        # BUG FIX: websocket-client 1.8 passes (wsapp, code, msg) → 3 args.
+        # Use *args to accept any number of arguments safely.
+        def on_close(*args):
+            code = args[1] if len(args) > 1 else None
+            msg  = args[2] if len(args) > 2 else None
+            logger.warning("WS closed: code=%s msg=%s", code, msg)
 
+        # ── Build & connect ───────────────────────────────────────────────────
         self._ws = SmartWebSocketV2(
             self.angel.auth_token, Cfg.API_KEY,
             Cfg.CLIENT_ID,         self.angel.feed_token,
