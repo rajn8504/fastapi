@@ -15,6 +15,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("bot")
@@ -669,7 +670,10 @@ TICK_SIZE   = 0.05
 
 
 def _round_tick(price: float) -> float:
-    return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
+    decimal_price = Decimal(str(price))
+    tick = Decimal(str(TICK_SIZE))
+    rounded = (decimal_price / tick).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * tick
+    return float(rounded)
 
 
 def _sl_price(entry: float, pct: float = 0.30) -> float:
@@ -774,27 +778,29 @@ class StateStore:
     def day_blocked(self) -> bool:
         return self.daily_pnl <= -Cfg.MAX_DAILY_LOSS or self.daily_pnl >= Cfg.DAILY_TARGET
 
-    def record_closed_trade(self, pnl: float) -> None:
-        # 📓 Trade Journal Auto-Writer
-        if self.active_trade:
-            try:
-                journal_path = self._path.parent / "trade_journal.jsonl"
-                jdata = asdict(self.active_trade)
-                jdata["exit_time"]    = datetime.now(IST).isoformat()
-                jdata["realised_pnl"] = pnl
-                jdata["trade_id"]     = self.trade_count + 1
-                with journal_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(jdata) + "\n")
-            except Exception:
-                pass
-
-        self.daily_pnl    = round(self.daily_pnl + pnl, 2)
-        self.trade_count += 1
-        if pnl < 0:
-            self.consec_losses += 1
-        else:
-            self.consec_losses = 0  # reset on win
-        self.active_trade = None
+    async def record_closed_trade(self, pnl: float) -> None:
+        async with self._lock:
+            # 📓 Trade Journal Auto-Writer
+            if self.active_trade:
+                try:
+                    journal_path = self._path.parent / "trade_journal.jsonl"
+                    jdata = asdict(self.active_trade)
+                    jdata["exit_time"]    = datetime.now(IST).isoformat()
+                    jdata["realised_pnl"] = pnl
+                    jdata["trade_id"]     = self.trade_count + 1
+                    with journal_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(jdata) + "\n")
+                except Exception:
+                    pass
+            
+            self.daily_pnl = round(self.daily_pnl + pnl, 2)
+            self.trade_count += 1
+            if pnl < 0:
+                self.consec_losses += 1
+            else:
+                self.consec_losses = 0  # reset on win
+                
+            self.active_trade = None
 
 
 # ── Angel One client ──────────────────────────────────────────────────────────
@@ -1283,8 +1289,8 @@ class TradingEngine:
                     logger.error("Subscribe failed: %s", sub_err)
 
         def on_data(_wsapp, message):
-            loop.call_soon_threadsafe(
-                asyncio.create_task, self._on_tick_raw(message)
+            asyncio.run_coroutine_threadsafe(
+                self._on_tick_raw(message), loop
             )
 
         def on_error(_wsapp, error):
@@ -1432,7 +1438,6 @@ class TradingEngine:
             symbol      = str(row["symbol"])
             token       = str(row["token"])
             raw_lot_sz  = int(float(row.get("lotsize") or _lot_qty(Cfg.UNDERLYING)))
-            qty         = Cfg.LOT_SIZE * raw_lot_sz
 
             if self._trade_mode_confirmed == "live" and Cfg.API_KEY:
                 opt_ltp = await self._loop.run_in_executor(  # type: ignore[union-attr]
@@ -1444,6 +1449,18 @@ class TradingEngine:
             if opt_ltp <= 0:
                 logger.warning("Option LTP 0 for %s — skipping", symbol)
                 return
+
+            # ── Dynamic Risk-Based Position Sizing ──
+            sl_est = _sl_price_dynamic(opt_ltp, atr=signal.entry_atr)
+            risk_per_share = max((opt_ltp - sl_est), 0.10)
+            max_risk_trade = Cfg.MAX_DAILY_LOSS * 0.25  # Max risk per trade: 25% of daily loss limit
+            
+            lots_by_risk = max(1, int(max_risk_trade / (risk_per_share * raw_lot_sz)))
+            lots_by_capital = max(1, int(Cfg.CAPITAL / (opt_ltp * raw_lot_sz)))
+            safe_lots = min(lots_by_risk, lots_by_capital, Cfg.LOT_SIZE)
+            
+            qty = safe_lots * raw_lot_sz
+            logger.info("📐 Sizing: Lots=%d (Risk Bound) Qty=%d", safe_lots, qty)
 
             order_id, filled_qty, avg_price = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed)
             sl       = _sl_price_dynamic(avg_price, atr=signal.entry_atr)
@@ -1592,7 +1609,7 @@ class TradingEngine:
                     except Exception as wse:
                         pass
                         
-                self.state.record_closed_trade(pnl)
+                await self.state.record_closed_trade(pnl)
                 self._trailing = None
                 await self.state.save()
 
