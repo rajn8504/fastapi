@@ -49,6 +49,7 @@ class SignalResult:
     volume_spike: bool
     adx:            float = 0.0
     ema_bullish:    bool  = False
+    ema_fast_slope: float = 0.0   # Added for Slope/Regime filter
     candle_pattern: str   = "NONE"
     entry_atr:      float = 0.0   # ATR at time of signal (for dynamic SL)
     generated_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
@@ -99,8 +100,9 @@ class IndicatorEngine:
         self._atr_smooth:  Optional[float] = None
 
         # EMA
-        self._ema_fast: Optional[float] = None
-        self._ema_slow: Optional[float] = None
+        self._ema_fast:      Optional[float] = None
+        self._ema_fast_prev: Optional[float] = None
+        self._ema_slow:      Optional[float] = None
 
         # ADX (Wilder smoothing)
         self._adx_s_plus_dm:  Optional[float] = None
@@ -284,11 +286,13 @@ class IndicatorEngine:
         kf = 2.0 / (self.EMA_FAST + 1)
         ks = 2.0 / (self.EMA_SLOW + 1)
         if self._ema_fast is None:
-            self._ema_fast = close
-            self._ema_slow = close
+            self._ema_fast_prev = close
+            self._ema_fast      = close
+            self._ema_slow      = close
         else:
-            self._ema_fast = close * kf + self._ema_fast * (1.0 - kf)
-            self._ema_slow = close * ks + self._ema_slow * (1.0 - ks)
+            self._ema_fast_prev = self._ema_fast
+            self._ema_fast      = close * kf + self._ema_fast * (1.0 - kf)
+            self._ema_slow      = close * ks + self._ema_slow * (1.0 - ks)
 
     @property
     def ema_fast(self) -> float:
@@ -297,6 +301,12 @@ class IndicatorEngine:
     @property
     def ema_slow(self) -> float:
         return round(self._ema_slow or 0.0, 2)
+
+    @property
+    def ema_fast_slope(self) -> float:
+        if not self._ema_fast or not self._ema_fast_prev:
+            return 0.0
+        return round(self._ema_fast - self._ema_fast_prev, 2)
 
     @property
     def ema_bullish(self) -> bool:
@@ -412,13 +422,16 @@ class AlphaStrategy:
         vol_spike  = indicator.volume_spike(current_volume)
         adx        = indicator.adx
         ema_bull   = indicator.ema_bullish
+        ema_slope  = indicator.ema_fast_slope
         pattern    = indicator.last_candle_pattern
 
         def _no(reason: str) -> SignalResult:
             return SignalResult(signal="NONE", strength=0, reason=reason,
                                 supertrend_dir=st_dir, above_vwap=above_vwap,
                                 rsi=rsi, volume_spike=vol_spike,
-                                adx=adx, ema_bullish=ema_bull, candle_pattern=pattern)
+                                adx=adx, ema_bullish=ema_bull, 
+                                ema_fast_slope=ema_slope,
+                                candle_pattern=pattern)
 
         if (t0 - self._last_signal_time) < self._signal_cooldown_s:
             return _no("Cooldown active")
@@ -435,6 +448,8 @@ class AlphaStrategy:
 
         # ── CALL ─────────────────────────────────────────────────────────────
         if st_dir == "UP" and ema_bull and above_vwap and rsi >= self.RSI_CALL_MIN:
+            if ema_slope < 1.0:
+                return _no(f"ST=UP ✓ — blocked: flat EMA slope ({ema_slope}) indicates whipsaw")
             if not vol_spike:
                 return _no(f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.CALL_BLOCK_PATTERNS:
@@ -447,12 +462,14 @@ class AlphaStrategy:
                 signal="CALL", strength=strength,
                 reason=f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} Ptn={pattern} LTP={ltp:.1f}",
                 supertrend_dir=st_dir, above_vwap=True, rsi=rsi, volume_spike=True,
-                adx=adx, ema_bullish=True, candle_pattern=pattern,
+                adx=adx, ema_bullish=True, ema_fast_slope=ema_slope, candle_pattern=pattern,
                 entry_atr=indicator.current_atr,
             )
 
         # ── PUT ──────────────────────────────────────────────────────────────
         if st_dir == "DOWN" and not ema_bull and not above_vwap and rsi <= self.RSI_PUT_MAX:
+            if ema_slope > -1.0:
+                return _no(f"ST=DOWN ✓ — blocked: flat EMA slope ({ema_slope}) indicates whipsaw")
             if not vol_spike:
                 return _no(f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.PUT_BLOCK_PATTERNS:
@@ -465,7 +482,7 @@ class AlphaStrategy:
                 signal="PUT", strength=strength,
                 reason=f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} Ptn={pattern} LTP={ltp:.1f}",
                 supertrend_dir=st_dir, above_vwap=False, rsi=rsi, volume_spike=True,
-                adx=adx, ema_bullish=False, candle_pattern=pattern,
+                adx=adx, ema_bullish=False, ema_fast_slope=ema_slope, candle_pattern=pattern,
                 entry_atr=indicator.current_atr,
             )
 
@@ -743,6 +760,19 @@ class StateStore:
         return self.daily_pnl <= -Cfg.MAX_DAILY_LOSS or self.daily_pnl >= Cfg.DAILY_TARGET
 
     def record_closed_trade(self, pnl: float) -> None:
+        # 📓 Trade Journal Auto-Writer
+        if self.active_trade:
+            try:
+                journal_path = self._path.parent / "trade_journal.jsonl"
+                jdata = asdict(self.active_trade)
+                jdata["exit_time"]    = datetime.now(IST).isoformat()
+                jdata["realised_pnl"] = pnl
+                jdata["trade_id"]     = self.trade_count + 1
+                with journal_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(jdata) + "\n")
+            except Exception:
+                pass
+
         self.daily_pnl    = round(self.daily_pnl + pnl, 2)
         self.trade_count += 1
         if pnl < 0:
@@ -1261,13 +1291,19 @@ class TradingEngine:
             return
         if self.state.day_blocked():
             return
-        if self.state.active_trade or not self._trade_armed:
-            return
 
+        # Continuous Background Execution (Crucial for Smart Exits)
         if token not in self.indicators:
             self.indicators[token] = IndicatorEngine()
         ind = self.indicators[token]
         ind.on_tick(tick)
+
+        if self.state.active_trade:
+            await self._check_smart_exit(ltp, ind)
+            return
+            
+        if not self._trade_armed:
+            return
 
         result = self.strategy.evaluate(ltp, ind, float(tick.volume))
         if result.signal in ("CALL", "PUT"):
@@ -1395,6 +1431,29 @@ class TradingEngine:
         except Exception as exc:
             await self.tg.alert_error("EXIT_ORDER", str(exc))
             return
+
+    async def _check_smart_exit(self, spot_ltp: float, ind: IndicatorEngine) -> None:
+        """Hybrid Early Exit: Reversal Pattern + Price breaking EMA9."""
+        trade = self.state.active_trade
+        if not trade or not self._trailing: return
+        
+        # Only deploy Smart Exits to protect large floating profits (reduce whip-outs)
+        act_ltp = self._option_ltp.get(trade.token, trade.entry_price)
+        pnl_unrealised = self._trailing.unrealised_pnl(act_ltp)
+        if pnl_unrealised < 250:
+            return
+
+        pattern = ind.last_candle_pattern
+        if trade.option_type == "CE":
+            if pattern in self.strategy.CALL_BLOCK_PATTERNS and spot_ltp < ind.ema_fast:
+                logger.info("🧠 Smart Exit Triggered: CE reversal %s + EMA break", pattern)
+                await self.tg.send(f"🧠 *Smart Exit triggered!*\nPattern: `{pattern}`\nSecured P&L: ₹{pnl_unrealised:.0f}")
+                await self._exit_trade(act_ltp, "SMART_EXIT")
+        else:
+            if pattern in self.strategy.PUT_BLOCK_PATTERNS and spot_ltp > ind.ema_fast:
+                logger.info("🧠 Smart Exit Triggered: PE reversal %s + EMA break", pattern)
+                await self.tg.send(f"🧠 *Smart Exit triggered!*\nPattern: `{pattern}`\nSecured P&L: ₹{pnl_unrealised:.0f}")
+                await self._exit_trade(act_ltp, "SMART_EXIT")
 
         pnl = round((ltp - trade.entry_price) * qty, 2)
         self.state.record_closed_trade(pnl)
