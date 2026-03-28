@@ -261,12 +261,16 @@ class IndicatorEngine:
 
     # ── Volume spike ──────────────────────────────────────────────────────────
 
-    def volume_spike(self, current_volume: float) -> bool:
+    @property
+    def current_volume(self) -> int:
+        return self._cur_volume
+
+    def volume_spike(self) -> bool:
         if len(self._candles) < self.VOLUME_SPIKE_LOOKBACK:
             return False
         recent = list(self._candles)[-self.VOLUME_SPIKE_LOOKBACK:]
         avg = sum(c.volume for c in recent) / len(recent)
-        return avg > 0 and current_volume >= avg * self.VOLUME_SPIKE_FACTOR
+        return avg > 0 and self._cur_volume >= avg * self.VOLUME_SPIKE_FACTOR
 
     @property
     def candles(self) -> List[Candle]:
@@ -412,14 +416,13 @@ class AlphaStrategy:
         t = _hhmm()
         return any(s <= t <= e for s, e in self.PRIME_WINDOWS)
 
-    def evaluate(self, ltp: float, indicator: IndicatorEngine,
-                 current_volume: float) -> SignalResult:
+    def evaluate(self, ltp: float, indicator: IndicatorEngine) -> SignalResult:
         t0         = time.time()
         vwap       = indicator.vwap
         rsi        = indicator.rsi
         st_dir     = indicator.supertrend_direction
         above_vwap = ltp > vwap if vwap > 0 else False
-        vol_spike  = indicator.volume_spike(current_volume)
+        vol_spike  = indicator.volume_spike()
         adx        = indicator.adx
         ema_bull   = indicator.ema_bullish
         ema_slope  = indicator.ema_fast_slope
@@ -738,6 +741,16 @@ class StateStore:
                 logger.warning("State load failed: %s", exc)
         self.day = today
 
+    async def check_day_rollover(self) -> None:
+        async with self._lock:
+            today = datetime.now(IST).strftime("%Y-%m-%d")
+            if self.day and self.day != today:
+                self.day = today
+                self.daily_pnl = 0.0
+                self.trade_count = 0
+                self.consec_losses = 0
+                logger.info("🌅 Day rollover! Resetting daily metrics for %s", today)
+
     async def save(self) -> None:
         async with self._lock:
             data = {
@@ -849,6 +862,21 @@ class AngelClient:
         except Exception:
             return 0.0
 
+    def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        self.ensure_session()
+        if not self._client:
+            return None
+        try:
+            resp = self._client.orderBook()
+            data = resp.get("data") if resp else None
+            if data and isinstance(data, list):
+                for order in data:
+                    if str(order.get("orderid", "")) == str(order_id):
+                        return order
+        except Exception as exc:
+            logger.warning("OrderBook fetch failed: %s", exc)
+        return None
+
 
 # ── Scrip master helpers ──────────────────────────────────────────────────────
 
@@ -914,7 +942,21 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
     
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, lambda: angel.place_order(params))
+        order_id = await loop.run_in_executor(None, lambda: angel.place_order(params))
+        
+        # ── Poll OrderBook to ensure fill ──
+        for _ in range(3):
+            await asyncio.sleep(1.0)
+            status_data = await loop.run_in_executor(None, lambda: angel.get_order_status(order_id))
+            if status_data:
+                status = str(status_data.get("status", "")).lower()
+                filled = int(status_data.get("filledshares", 0))
+                if "rejected" in status or "cancelled" in status:
+                    if filled == 0:
+                        raise RuntimeError(f"Order {order_id} {status}: {status_data.get('text', '')}")
+                if "completed" in status or filled >= qty:
+                    break
+        return order_id
     except Exception as exc:
         raise RuntimeError(f"Angel One API Order Error: {exc}")
 
@@ -974,6 +1016,8 @@ class TradingEngine:
         self._sim_price  = 55000.0    # BankNifty base price
         self._sim_volume = 0
         self._sim_candle_count = 0
+        self._exit_in_progress = False
+        self._ws_connected   = False
 
     @property
     def _demo_mode(self) -> bool:
@@ -1136,24 +1180,35 @@ class TradingEngine:
         ltp        = tick.ltp
         spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
 
-        self._spot_ltp[Cfg.UNDERLYING] = ltp
+        if token == spot_token:
+            self._spot_ltp[Cfg.UNDERLYING] = ltp
 
         # Track option price for active demo trade
         if self.state.active_trade and token == self.state.active_trade.token:
             self._option_ltp[token] = ltp
             await self._manage_trailing(ltp)
 
+        if token != spot_token:
+            return
+            
+        await self.state.check_day_rollover()
+
         if self.state.day_blocked():
             return
-        if self.state.active_trade or not self._trade_armed:
-            return    # Armed but already in trade, or not armed
 
         if token not in self.indicators:
             self.indicators[token] = IndicatorEngine()
         ind = self.indicators[token]
         ind.on_tick(tick)
 
-        result = self.strategy.evaluate(ltp, ind, float(tick.volume))
+        if self.state.active_trade:
+            await self._check_smart_exit(ltp, ind)
+            return
+
+        if not self._trade_armed:
+            return
+
+        result = self.strategy.evaluate(ltp, ind)
         if result.signal in ("CALL", "PUT"):
             elapsed = (time.monotonic() - t_start) * 1000
             logger.info("🎯 DEMO %s | RSI=%.1f | ST=%s | eval=%.1fms",
@@ -1197,6 +1252,7 @@ class TradingEngine:
         # ── Callback definitions ───────────────────────────────────────────────
 
         def on_open(wsapp):
+            self._ws_connected = True
             logger.info("WebSocket connected ✅ — subscribing to %s", spot_token)
             # BUG FIX: subscribe() is a method of SmartWebSocketV2, NOT wsapp.
             # wsapp is the underlying websocket-client WebSocketApp object.
@@ -1213,11 +1269,13 @@ class TradingEngine:
             )
 
         def on_error(_wsapp, error):
+            self._ws_connected = False
             logger.error("WS error: %s", error)
 
         # BUG FIX: websocket-client 1.8 passes (wsapp, code, msg) → 3 args.
         # Use *args to accept any number of arguments safely.
         def on_close(*args):
+            self._ws_connected = False
             code = args[1] if len(args) > 1 else None
             msg  = args[2] if len(args) > 2 else None
             logger.warning("WS closed: code=%s msg=%s", code, msg)
@@ -1262,6 +1320,8 @@ class TradingEngine:
     def _parse_tick(self, message: Any) -> Optional[Dict[str, Any]]:
         if isinstance(message, dict):
             ltp = float(message.get("last_traded_price", message.get("ltp", 0)) or 0)
+            if ltp > 1000000.0:  # Heuristic for paisa -> rupees conversion
+                ltp /= 100.0
             return {
                 "token":  str(message.get("token", "")),
                 "ltp":    ltp,
@@ -1296,6 +1356,9 @@ class TradingEngine:
 
         if token != spot_token:
             return
+        
+        await self.state.check_day_rollover()
+        
         # Skip market hours check in demo mode (simulation bypasses via _process_tick_demo)
         if not self._demo_mode and (not _is_trading_hours() or self.state.day_blocked()):
             return
@@ -1315,7 +1378,7 @@ class TradingEngine:
         if not self._trade_armed:
             return
 
-        result = self.strategy.evaluate(ltp, ind, float(tick.volume))
+        result = self.strategy.evaluate(ltp, ind)
         if result.signal in ("CALL", "PUT"):
             elapsed = (time.monotonic() - t_start) * 1000
             logger.info("🎯 %s | RSI=%.1f | ST=%s | eval=%.1fms",
@@ -1444,45 +1507,51 @@ class TradingEngine:
             await self._exit_trade(ltp, "STOP_LOSS_HIT")
 
     async def _exit_trade(self, ltp: float, reason: str = "SIGNAL_EXIT") -> None:
+        if self._exit_in_progress:
+            return
         if not self.state.active_trade:
             return
-        trade = self.state.active_trade
-        qty   = trade.lot_size * _lot_qty(trade.symbol)
+        self._exit_in_progress = True
         try:
-            await place_limit_order(self.angel, trade.symbol, trade.token, qty, "SELL", ltp, trade_mode=trade.mode)
-        except Exception as exc:
-            await self.tg.alert_error("EXIT_ORDER", str(exc))
-            return
-            
-        # 📡 Unsubscribe Option Token
-        if self._ws:
+            trade = self.state.active_trade
+            qty   = trade.lot_size * _lot_qty(trade.symbol)
             try:
-                spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
-                sub_p = []
-                if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
-                self._ws.subscribe("bot_spot", 3, sub_p)
-                logger.info("📡 Live WS Reverted to Spot only.")
-            except Exception as wse:
-                pass
+                await place_limit_order(self.angel, trade.symbol, trade.token, qty, "SELL", ltp, trade_mode=trade.mode)
+            except Exception as exc:
+                await self.tg.alert_error("EXIT_ORDER", str(exc))
+                return
+                
+            # 📡 Unsubscribe Option Token
+            if self._ws:
+                try:
+                    spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                    sub_p = []
+                    if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
+                    self._ws.subscribe("bot_spot", 3, sub_p)
+                    logger.info("📡 Live WS Reverted to Spot only.")
+                except Exception as wse:
+                    pass
 
-        # === 📉 Book-keeping Block ===
-        pnl = round((ltp - trade.entry_price) * qty, 2)
-        self.state.record_closed_trade(pnl)
-        self._trailing = None
-        await self.state.save()
+            # === 📉 Book-keeping Block ===
+            pnl = round((ltp - trade.entry_price) * qty, 2)
+            self.state.record_closed_trade(pnl)
+            self._trailing = None
+            await self.state.save()
 
-        emoji = "🟢" if pnl >= 0 else "🔴"
-        await self.tg.send(
-            f"{emoji} *TRADE CLOSED* — {reason}\n"
-            f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
-            f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
-        )
-        if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
-            self._trade_armed = False
+            emoji = "🟢" if pnl >= 0 else "🔴"
             await self.tg.send(
-                "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
-                f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                f"{emoji} *TRADE CLOSED* — {reason}\n"
+                f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
+                f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
             )
+            if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
+                self._trade_armed = False
+                await self.tg.send(
+                    "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
+                    f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                )
+        finally:
+            self._exit_in_progress = False
 
     async def _check_smart_exit(self, spot_ltp: float, ind: IndicatorEngine) -> None:
         """Hybrid Early Exit: Reversal Pattern + Price breaking EMA9."""
@@ -1521,6 +1590,7 @@ class TradingEngine:
     async def _maintenance_loop(self) -> None:
         while self._running:
             try:
+                await self.state.check_day_rollover()
                 if _hhmm() == 1425 and self.state.active_trade:
                     t   = self.state.active_trade
                     ltp = t.entry_price
@@ -1604,7 +1674,7 @@ class TradingEngine:
         # ── 5. WebSocket / tick feed check ────────────────────────────────────
         if self._demo_mode:
             results["TickFeed"] = ("ℹ️", "Demo simulation active (no WS needed)", False)
-        elif self._ws is not None:
+        elif self._ws is not None and self._ws_connected:
             results["TickFeed"] = ("✅", "WebSocket connected", False)
         else:
             results["TickFeed"] = ("⚠️", "WS not connected — will auto-reconnect", False)
@@ -1704,8 +1774,7 @@ class TradingEngine:
                 parse_mode="Markdown",
             )
             return
-        vol    = float(ind.candles[-1].volume) if ind.candles else 0.0
-        result = self.strategy.evaluate(spot, ind, vol)
+        result = self.strategy.evaluate(spot, ind)
         label  = "✅ *Strong Signal Found!*" if result.signal != "NONE" else "❌ *No Signal Yet*"
         await update.message.reply_text(
             f"{label}\n"
