@@ -925,7 +925,7 @@ def find_atm_option(rows: List[Dict], underlying: str, spot: float,
 
 async def place_limit_order(angel: AngelClient, symbol: str, token: str,
                              qty: int, action: str, ltp: float,
-                             buffer: float = -1.0, trade_mode: str = "paper") -> str:
+                             buffer: float = -1.0, trade_mode: str = "paper") -> Tuple[str, int, float]:
     if buffer < 0:
         buffer = Cfg.SLIPPAGE_BUFFER
     price  = _round_tick(ltp + buffer if action == "BUY" else ltp - buffer)
@@ -938,25 +938,33 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
     if trade_mode == "paper":
         sim_id = f"PAPER_{int(time.time() * 1000)}"
         logger.info("[PAPER] %s %s qty=%d @%.2f", action, symbol, qty, price)
-        return sim_id
+        return sim_id, qty, price
     
     loop = asyncio.get_running_loop()
     try:
         order_id = await loop.run_in_executor(None, lambda: angel.place_order(params))
         
         # ── Poll OrderBook to ensure fill ──
-        for _ in range(3):
+        final_filled = 0
+        final_price  = 0.0
+        for _ in range(4):
             await asyncio.sleep(1.0)
             status_data = await loop.run_in_executor(None, lambda: angel.get_order_status(order_id))
             if status_data:
                 status = str(status_data.get("status", "")).lower()
-                filled = int(status_data.get("filledshares", 0))
+                final_filled = int(status_data.get("filledshares", 0) or 0)
+                final_price = float(status_data.get("averageprice", 0) or 0.0)
                 if "rejected" in status or "cancelled" in status:
-                    if filled == 0:
+                    if final_filled == 0:
                         raise RuntimeError(f"Order {order_id} {status}: {status_data.get('text', '')}")
-                if "completed" in status or filled >= qty:
                     break
-        return order_id
+                if "completed" in status or final_filled >= qty:
+                    break
+        
+        if final_filled == 0:
+            raise RuntimeError(f"Order {order_id} failed to fill within IOC timeout.")
+            
+        return order_id, final_filled, final_price
     except Exception as exc:
         raise RuntimeError(f"Angel One API Order Error: {exc}")
 
@@ -1133,10 +1141,10 @@ class TradingEngine:
             self._sim_price = max(40000.0, min(70000.0, self._sim_price))
 
             # ── Volume simulation (spike every ~10 candles) ────────────────────
-            self._sim_volume += rng.randint(800, 2000)
+            delta_vol = rng.randint(800, 2000)
             # Inject a volume spike when we're in strong trend phase
             if candle_num >= 10 and (tick_count % CANDLE_TICKS) == 5:
-                self._sim_volume += base_vol * 3   # 3× average spike
+                delta_vol += base_vol * 3   # 3× average spike
 
             # ── Build the tick using fake 5-min candle boundaries ─────────────
             # Map real elapsed seconds → fake 5-min epoch so IndicatorEngine
@@ -1147,7 +1155,7 @@ class TradingEngine:
             tick = Tick(
                 token=spot_token,
                 ltp=self._sim_price,
-                volume=self._sim_volume,
+                volume=delta_vol,
                 timestamp_ms=ts_ms,
             )
 
@@ -1319,9 +1327,9 @@ class TradingEngine:
 
     def _parse_tick(self, message: Any) -> Optional[Dict[str, Any]]:
         if isinstance(message, dict):
+            # Angel One Websocket V2 Dict payloads provide `last_traded_price` strictly in paise.
             ltp = float(message.get("last_traded_price", message.get("ltp", 0)) or 0)
-            if ltp > 1000000.0:  # Heuristic for paisa -> rupees conversion
-                ltp /= 100.0
+            ltp /= 100.0  # Force conversion to Rupees
             return {
                 "token":  str(message.get("token", "")),
                 "ltp":    ltp,
@@ -1426,20 +1434,20 @@ class TradingEngine:
                 logger.warning("Option LTP 0 for %s — skipping", symbol)
                 return
 
-            order_id = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed)
-            sl       = _sl_price_dynamic(opt_ltp, atr=signal.entry_atr)
+            order_id, filled_qty, avg_price = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed)
+            sl       = _sl_price_dynamic(avg_price, atr=signal.entry_atr)
 
             trade = ActiveTrade(
                 order_id=order_id, symbol=symbol, token=token,
-                option_type=option_type, lot_size=Cfg.LOT_SIZE,
-                entry_price=opt_ltp, sl_price=sl,
+                option_type=option_type, lot_size=filled_qty,
+                entry_price=avg_price, sl_price=sl,
                 entry_time=datetime.now(IST).isoformat(),
                 mode=self._trade_mode_confirmed,
             )
             self.state.active_trade = trade
             self._trailing = TrailingState(
-                entry_price=opt_ltp, current_sl=sl,
-                high_water=opt_ltp, lot_size=qty,
+                entry_price=avg_price, current_sl=sl,
+                high_water=avg_price, lot_size=filled_qty,
             )
             await self.state.save()
 
@@ -1514,16 +1522,37 @@ class TradingEngine:
         self._exit_in_progress = True
         try:
             trade = self.state.active_trade
-            qty   = trade.lot_size * _lot_qty(trade.symbol)
-            try:
-                await place_limit_order(self.angel, trade.symbol, trade.token, qty, "SELL", ltp, trade_mode=trade.mode)
-            except Exception as exc:
-                await self.tg.alert_error("EXIT_ORDER", str(exc))
+            rem_qty = trade.lot_size
+            total_sold = 0
+            weighted_prc = 0.0
+
+            for attempt in range(3):
+                try:
+                    _oid, sold_qty, avg_prc = await place_limit_order(
+                        self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
+                    )
+                    if sold_qty > 0 and avg_prc > 0:
+                        weighted_prc += (sold_qty * avg_prc)
+                        total_sold += sold_qty
+                        rem_qty -= sold_qty
+
+                    if rem_qty <= 0:
+                        break
+                except Exception as exc:
+                    if attempt == 2 and total_sold == 0:
+                        await self.tg.alert_error("EXIT_ORDER", str(exc))
+                        return
+                    await asyncio.sleep(1.0)
+
+            if total_sold == 0:
                 return
+
+            final_exit_price = round(weighted_prc / total_sold, 2)
                 
             # 📡 Unsubscribe Option Token
             if self._ws:
                 try:
+                    self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
                     spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
                     sub_p = []
                     if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
@@ -1533,23 +1562,38 @@ class TradingEngine:
                     pass
 
             # === 📉 Book-keeping Block ===
-            pnl = round((ltp - trade.entry_price) * qty, 2)
-            self.state.record_closed_trade(pnl)
-            self._trailing = None
-            await self.state.save()
+            pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
 
-            emoji = "🟢" if pnl >= 0 else "🔴"
-            await self.tg.send(
-                f"{emoji} *TRADE CLOSED* — {reason}\n"
-                f"`{trade.symbol}` Exit: ₹{ltp:.2f}\n"
-                f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
-            )
-            if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
-                self._trade_armed = False
+            if rem_qty > 0:
+                trade.lot_size = rem_qty
+                if self._trailing:
+                    self._trailing.lot_size = rem_qty
+                self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
+                self.state.trade_count += 1
+                await self.state.save()
                 await self.tg.send(
-                    "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
-                    f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                    f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
+                    f"`{trade.symbol}` Exit Avg: ₹{final_exit_price:.2f}\n"
+                    f"Sold: {total_sold} | Stranded: {rem_qty}\n"
+                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
                 )
+            else:
+                self.state.record_closed_trade(pnl)
+                self._trailing = None
+                await self.state.save()
+
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                await self.tg.send(
+                    f"{emoji} *TRADE CLOSED* — {reason}\n"
+                    f"`{trade.symbol}` Exit: ₹{final_exit_price:.2f}\n"
+                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
+                )
+                if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
+                    self._trade_armed = False
+                    await self.tg.send(
+                        "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
+                        f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                    )
         finally:
             self._exit_in_progress = False
 
@@ -1750,15 +1794,18 @@ class TradingEngine:
         trade_info = "None"
         if t:
             opt_ltp = self._option_ltp.get(t.token, t.entry_price)
-            unreal  = round((opt_ltp - t.entry_price) * t.lot_size * _lot_qty(t.symbol), 2)
+            unreal  = round((opt_ltp - t.entry_price) * t.lot_size, 2)
             trade_info = f"`{t.symbol}` Entry=₹{t.entry_price:.2f} SL=₹{t.sl_price:.2f} Unreal=₹{unreal:+.0f}"
+        
+        mode_str = self._trade_mode_confirmed.upper() if self._trade_armed else "UNARMED"
+        
         await update.message.reply_text(
             f"📊 *Bot Status* — `{_now_label()}`\n"
             f"Balance: ₹{bal:,.0f}\n"
             f"Today P&L: ₹{self.state.daily_pnl:+.0f}\n"
             f"Trades today: {self.state.trade_count}\n"
             f"Active Trade: {trade_info}\n"
-            f"Armed: {'✅' if self._trade_armed else '❌'}\n"
+            f"Armed: {'✅' if self._trade_armed else '❌'} ({mode_str})\n"
             f"Market Health: {mhi['label']} (score={mhi['score']})\n"
             f"VIX: {self._vix:.1f}  A-D: {self._ad_ratio:.2f}",
             parse_mode="Markdown",
@@ -1859,7 +1906,6 @@ class TradingEngine:
         await update.message.reply_text(
             f"👋 *வணக்கம் {name}!*\n\n"
             f"🤖 Ultra-Fast Algo Bot இயங்குகிறது!\n\n"
-            f"Mode: `{Cfg.TRADE_MODE.upper()}`\n"
             f"Underlying: `{Cfg.UNDERLYING}`\n"
             f"Capital: ₹{Cfg.CAPITAL:,.0f}\n\n"
             f"Commands பார்க்க /help அனுப்பவும்\n"
