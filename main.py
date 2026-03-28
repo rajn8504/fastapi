@@ -949,22 +949,24 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
         # ── Poll OrderBook to ensure fill ──
         final_filled = 0
         final_price  = 0.0
-        for _ in range(4):
+        for _ in range(8):
             await asyncio.sleep(1.0)
             status_data = await loop.run_in_executor(None, lambda: angel.get_order_status(order_id))
             if status_data:
                 status = str(status_data.get("status", "")).lower()
                 final_filled = int(status_data.get("filledshares", 0) or 0)
                 final_price = float(status_data.get("averageprice", 0) or 0.0)
-                if final_filled > 0 and final_price <= 0.0:
-                    final_price = ltp
 
                 if "rejected" in status or "cancelled" in status:
                     if final_filled == 0:
                         raise RuntimeError(f"Order {order_id} {status}: {status_data.get('text', '')}")
                     break
                 if "completed" in status or final_filled >= qty:
-                    break
+                    if final_price > 0.0:
+                        break
+        
+        if final_filled > 0 and final_price <= 0.0:
+            final_price = ltp
         
         if final_filled == 0:
             raise RuntimeError(f"Order {order_id} failed to fill within IOC timeout.")
@@ -1060,7 +1062,7 @@ class TradingEngine:
 
         await self.tg.send(
             f"🤖 *Ultra-Fast Algo Bot Started*\n"
-            f"Mode: `{Cfg.TRADE_MODE.upper()}`  Underlying: `{Cfg.UNDERLYING}`\n"
+            f"Mode: `{self._trade_mode_confirmed.upper()}`  Underlying: `{Cfg.UNDERLYING}`\n"
             f"Capital: ₹{Cfg.CAPITAL:,.0f}  MaxLoss: ₹{Cfg.MAX_DAILY_LOSS:,.0f}\n"
             f"Target: ₹{Cfg.DAILY_TARGET:,.0f}  Lot: {Cfg.LOT_SIZE}\n"
             f"Time: `{_now_label()}`\n\n"
@@ -1570,7 +1572,6 @@ class TradingEngine:
                 if self._trailing:
                     self._trailing.lot_size = rem_qty
                 self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
-                self.state.trade_count += 1
                 await self.state.save()
                 await self.tg.send(
                     f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
