@@ -64,8 +64,8 @@ class IndicatorEngine:
     RSI_PERIOD            = 9
     SUPERTREND_PERIOD     = 10
     SUPERTREND_MULTIPLIER = 3.0
-    VOLUME_SPIKE_LOOKBACK = 15   # 75-min baseline (was 5)
-    VOLUME_SPIKE_FACTOR   = 2.5  # stricter: 2.5× avg (was 2.0×)
+    VOLUME_SPIKE_LOOKBACK = 15   # 75-min baseline
+    VOLUME_SPIKE_FACTOR   = 2.0  # (Down from 2.5) catch more breakouts
     EMA_FAST              = 9
     EMA_SLOW              = 21
     ADX_PERIOD            = 14
@@ -393,7 +393,7 @@ class AlphaStrategy:
 
     def __init__(self, bypass_time_filter: bool = False) -> None:
         self._last_signal_time   = 0.0
-        self._signal_cooldown_s  = 60.0
+        self._signal_cooldown_s  = 180.0  # Increased cooldown to 3 mins
         self._bypass_time_filter = bypass_time_filter  # True in demo/paper mode
 
     def _in_prime_window(self) -> bool:
@@ -731,7 +731,10 @@ class StateStore:
                 "saved_at":     datetime.now(IST).isoformat(),
             }
             try:
-                self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                # 🛡️ Atomic Save (Prevents corruption on crash)
+                tmp_file = self._path.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                tmp_file.replace(self._path)
             except Exception as exc:
                 logger.error("State save failed: %s", exc)
 
