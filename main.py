@@ -406,6 +406,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
+# ── Static IP Proxy Setup (Railway → AngelOne API) ────────────────────────────
+# Railway-ல் HTTP_PROXY மற்றும் HTTPS_PROXY variable செட் செய்யப்பட்டால்
+# அனைத்து outgoing requests-உம் proxy வழியாக செல்லும் (Static IP கிடைக்கும்)
+_proxy_url = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+if _proxy_url:
+    os.environ.setdefault("HTTP_PROXY",  _proxy_url)
+    os.environ.setdefault("HTTPS_PROXY", _proxy_url)
+    os.environ["ALL_PROXY"] = _proxy_url
+    logging.getLogger("bot").info("✅ Proxy configured: %s", _proxy_url.split("@")[-1])
+else:
+    logging.getLogger("bot").warning(
+        "⚠️  HTTP_PROXY / HTTPS_PROXY not set — Railway-ல் proxy variable add செய்யுங்கள்!"
+    )
+# ─────────────────────────────────────────────────────────────────────────────
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
