@@ -708,6 +708,8 @@ class ActiveTrade:
     sl_price:    float
     entry_time:  str
     mode:        str
+    high_water:  float = 0.0
+    is_breakeven: bool = False
 
 
 class StateStore:
@@ -954,6 +956,9 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
                 status = str(status_data.get("status", "")).lower()
                 final_filled = int(status_data.get("filledshares", 0) or 0)
                 final_price = float(status_data.get("averageprice", 0) or 0.0)
+                if final_filled > 0 and final_price <= 0.0:
+                    final_price = ltp
+
                 if "rejected" in status or "cancelled" in status:
                     if final_filled == 0:
                         raise RuntimeError(f"Order {order_id} {status}: {status_data.get('text', '')}")
@@ -1066,11 +1071,15 @@ class TradingEngine:
             t = self.state.active_trade
             self._trailing = TrailingState(
                 entry_price=t.entry_price, current_sl=t.sl_price,
-                high_water=t.entry_price, lot_size=t.lot_size * _lot_qty(t.symbol),
+                high_water=getattr(t, 'high_water', 0.0) or t.entry_price,
+                lot_size=t.lot_size,
             )
+            if getattr(t, 'is_breakeven', False):
+                self._trailing.is_breakeven = True
             await self.tg.send(
                 f"♻️ *Resumed trade from saved state*\n"
-                f"`{t.symbol}` Entry=₹{t.entry_price:.2f} SL=₹{t.sl_price:.2f}"
+                f"`{t.symbol}` Entry=₹{t.entry_price:.2f} SL=₹{t.sl_price:.2f}\n"
+                f"Qty=*{t.lot_size}* | High Water=₹{self._trailing.high_water:.2f}"
             )
 
         asyncio.create_task(self._maintenance_loop())
@@ -1443,6 +1452,8 @@ class TradingEngine:
                 entry_price=avg_price, sl_price=sl,
                 entry_time=datetime.now(IST).isoformat(),
                 mode=self._trade_mode_confirmed,
+                high_water=avg_price,
+                is_breakeven=False
             )
             self.state.active_trade = trade
             self._trailing = TrailingState(
@@ -1466,9 +1477,9 @@ class TradingEngine:
             elapsed = (time.monotonic() - t0) * 1000
             logger.info("✅ Order in %.1fms", elapsed)
             await self.tg.send(
-                f"✅ *ORDER PLACED* — `{signal.signal}` (Strength: {signal.strength}%)\n"
+                f"🤝 *TRADE EXECUTED* — `{signal.signal}` (Strength: {signal.strength}%)\n"
                 f"Symbol: `{symbol}`\n"
-                f"Qty: {qty} | Entry: ₹{opt_ltp:.2f} | SL: ₹{sl:.2f}\n"
+                f"Qty: {filled_qty} | Avg Entry: ₹{avg_price:.2f} | SL: ₹{sl:.2f}\n"
                 f"ADX: {signal.adx:.1f} | EMA: {'🟢' if signal.ema_bullish else '🔴'} | Pattern: `{signal.candle_pattern}`\n"
                 f"_{signal.reason}_\n"
                 f"⚡ *{elapsed:.0f}ms*"
@@ -1503,6 +1514,8 @@ class TradingEngine:
 
         if changed:
             trade.sl_price = self._trailing.current_sl
+            trade.high_water = self._trailing.high_water
+            trade.is_breakeven = self._trailing.is_breakeven
             await self.state.save()
             pnl = self._trailing.unrealised_pnl(ltp)
             be  = " 🔒 Breakeven" if self._trailing.is_breakeven else ""
@@ -1531,7 +1544,7 @@ class TradingEngine:
                     _oid, sold_qty, avg_prc = await place_limit_order(
                         self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
                     )
-                    if sold_qty > 0 and avg_prc > 0:
+                    if sold_qty > 0:
                         weighted_prc += (sold_qty * avg_prc)
                         total_sold += sold_qty
                         rem_qty -= sold_qty
@@ -1548,19 +1561,7 @@ class TradingEngine:
                 return
 
             final_exit_price = round(weighted_prc / total_sold, 2)
-                
-            # 📡 Unsubscribe Option Token
-            if self._ws:
-                try:
-                    self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
-                    spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
-                    sub_p = []
-                    if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
-                    self._ws.subscribe("bot_spot", 3, sub_p)
-                    logger.info("📡 Live WS Reverted to Spot only.")
-                except Exception as wse:
-                    pass
-
+            
             # === 📉 Book-keeping Block ===
             pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
 
@@ -1578,6 +1579,18 @@ class TradingEngine:
                     f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
                 )
             else:
+                # 📡 Unsubscribe Option Token (ONLY ON COMPLETE FULL EXIT)
+                if self._ws:
+                    try:
+                        self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
+                        spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                        sub_p = []
+                        if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
+                        self._ws.subscribe("bot_spot", 3, sub_p)
+                        logger.info("📡 Live WS Reverted to Spot only.")
+                    except Exception as wse:
+                        pass
+                        
                 self.state.record_closed_trade(pnl)
                 self._trailing = None
                 await self.state.save()
