@@ -939,6 +939,7 @@ class TradingEngine:
         self._ad_ratio = 1.0
         self._last_pct_notify: Dict[str, float] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._prev_vol: Dict[str, int] = {}  # Delta volume map
         # Simulation state
         self._sim_price  = 55000.0    # BankNifty base price
         self._sim_volume = 0
@@ -1201,11 +1202,17 @@ class TradingEngine:
                 return
             token  = str(data.get("token", ""))
             ltp    = float(data.get("ltp", 0))
-            vol    = int(data.get("volume", 0))
+            raw_vol= int(data.get("volume", 0))
             ts_ms  = int(data.get("ts_ms", time.time() * 1000))
             if ltp <= 0:
                 return
-            tick = Tick(token=token, ltp=ltp, volume=vol, timestamp_ms=ts_ms)
+            
+            # 🛡️ Delta Volume tracking (Angel V2 sends cumulative)
+            prev = self._prev_vol.get(token, raw_vol)
+            delta_vol = max(0, raw_vol - prev)
+            self._prev_vol[token] = raw_vol
+
+            tick = Tick(token=token, ltp=ltp, volume=delta_vol, timestamp_ms=ts_ms)
             await self._process_tick(tick, t_start)
         except Exception as exc:
             logger.debug("Tick error: %s", exc)
