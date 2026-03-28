@@ -611,6 +611,12 @@ class Cfg:
     DAILY_TARGET   = float(_get_env("DAILY_TARGET",   default="1500"))
     LOT_SIZE       = int(_get_env("LOT_SIZE",         default="1"))
 
+    # ── Capital Protection Settings ─────────────────────────────────────────
+    MAX_DAILY_TRADES    = int(_get_env("MAX_DAILY_TRADES",    default="2"))    # max trades/day
+    MIN_SIGNAL_STRENGTH = int(_get_env("MIN_SIGNAL_STRENGTH", default="75"))   # min strength to trade
+    CONSEC_LOSS_STOP    = int(_get_env("CONSEC_LOSS_STOP",    default="2"))    # stop after N consecutive losses
+    PROFIT_LOCK_AT      = float(_get_env("PROFIT_LOCK_AT",    default="500"))  # lock profits (tighten SL) above this
+
     UNDERLYING  = _get_env("UNDERLYING",  default="BANKNIFTY")
     TRADE_MODE  = _get_env("TRADE_MODE",  default="paper").lower()
     STATE_FILE  = Path(_get_env("STATE_FILE", default="db.json"))
@@ -687,8 +693,9 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
-        self.daily_pnl   = 0.0
-        self.trade_count = 0
+        self.daily_pnl       = 0.0
+        self.trade_count     = 0
+        self.consec_losses   = 0   # consecutive losing trades today
         self.active_trade: Optional[ActiveTrade] = None
         self.day = ""
         self._load()
@@ -699,13 +706,15 @@ class StateStore:
             try:
                 data = json.loads(self._path.read_text(encoding="utf-8"))
                 if data.get("day") == today:
-                    self.daily_pnl   = float(data.get("daily_pnl", 0.0))
-                    self.trade_count = int(data.get("trade_count", 0))
+                    self.daily_pnl     = float(data.get("daily_pnl", 0.0))
+                    self.trade_count   = int(data.get("trade_count", 0))
+                    self.consec_losses = int(data.get("consec_losses", 0))
                     raw = data.get("active_trade")
                     if raw:
                         self.active_trade = ActiveTrade(**raw)
                     self.day = today
-                    logger.info("State restored — PnL=%.0f trades=%d", self.daily_pnl, self.trade_count)
+                    logger.info("State restored — PnL=%.0f trades=%d consec_loss=%d",
+                                self.daily_pnl, self.trade_count, self.consec_losses)
                     return
             except Exception as exc:
                 logger.warning("State load failed: %s", exc)
@@ -717,6 +726,7 @@ class StateStore:
                 "day":          self.day,
                 "daily_pnl":    self.daily_pnl,
                 "trade_count":  self.trade_count,
+                "consec_losses":self.consec_losses,
                 "active_trade": asdict(self.active_trade) if self.active_trade else None,
                 "saved_at":     datetime.now(IST).isoformat(),
             }
@@ -731,6 +741,10 @@ class StateStore:
     def record_closed_trade(self, pnl: float) -> None:
         self.daily_pnl    = round(self.daily_pnl + pnl, 2)
         self.trade_count += 1
+        if pnl < 0:
+            self.consec_losses += 1
+        else:
+            self.consec_losses = 0  # reset on win
         self.active_trade = None
 
 
@@ -1235,6 +1249,22 @@ class TradingEngine:
     # ── Order execution ───────────────────────────────────────────────────────
 
     async def _fire_order(self, signal: SignalResult, spot_ltp: float) -> None:
+        # ── Capital Protection Gates ──────────────────────────────────────────
+        # Gate 1: Max trades per day
+        if self.state.trade_count >= Cfg.MAX_DAILY_TRADES:
+            logger.info("🛑 Max daily trades (%d) reached — no new trade", Cfg.MAX_DAILY_TRADES)
+            return
+        # Gate 2: Minimum signal strength
+        if signal.strength < Cfg.MIN_SIGNAL_STRENGTH:
+            logger.info("🛑 Signal strength %d%% < minimum %d%% — skipping",
+                        signal.strength, Cfg.MIN_SIGNAL_STRENGTH)
+            return
+        # Gate 3: Consecutive loss stop
+        if self.state.consec_losses >= Cfg.CONSEC_LOSS_STOP:
+            logger.info("🛑 %d consecutive losses — trading stopped for today",
+                        self.state.consec_losses)
+            return
+
         t0 = time.monotonic()
         try:
             option_type = "CE" if signal.signal == "CALL" else "PE"
@@ -1295,15 +1325,32 @@ class TradingEngine:
             return
         trade = self.state.active_trade
         changed, new_sl = self._trailing.update(ltp)
+
+        # ── Profit Lock: when daily P&L crosses PROFIT_LOCK_AT, tighten SL aggressively
+        pnl_unrealised = self._trailing.unrealised_pnl(ltp)
+        if self.state.daily_pnl + pnl_unrealised >= Cfg.PROFIT_LOCK_AT:
+            # Lock SL at 95% of current price (only 5% give-back allowed)
+            lock_sl = _round_tick(ltp * 0.95)
+            if lock_sl > self._trailing.current_sl:
+                self._trailing.current_sl = lock_sl
+                trade.sl_price            = lock_sl
+                changed                   = True
+                logger.info("🔒 Profit Lock activated: SL locked at ₹%.2f", lock_sl)
+                await self.tg.send(
+                    f"🔒 *Profit Lock Activated!*\n"
+                    f"Daily P&L: ₹{self.state.daily_pnl + pnl_unrealised:+.0f} ≥ ₹{Cfg.PROFIT_LOCK_AT:.0f}\n"
+                    f"SL tightened to ₹{lock_sl:.2f} (5% give-back only)"
+                )
+
         if changed:
-            trade.sl_price = new_sl
+            trade.sl_price = self._trailing.current_sl
             await self.state.save()
             pnl = self._trailing.unrealised_pnl(ltp)
             be  = " 🔒 Breakeven" if self._trailing.is_breakeven else ""
             await self.tg.send(
                 f"📈 *SL TRAILED*{be}\n"
                 f"`{trade.symbol}` LTP=₹{ltp:.2f}\n"
-                f"New SL: ₹{new_sl:.2f}  Unrealised P&L: ₹{pnl:.0f}"
+                f"New SL: ₹{self._trailing.current_sl:.2f}  Unrealised P&L: ₹{pnl:.0f}"
             )
         if ltp <= trade.sl_price:
             await self._exit_trade(ltp, "STOP_LOSS_HIT")
