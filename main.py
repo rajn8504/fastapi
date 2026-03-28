@@ -593,7 +593,13 @@ if _proxy_url:
     os.environ.setdefault("HTTP_PROXY",  _proxy_url)
     os.environ.setdefault("HTTPS_PROXY", _proxy_url)
     os.environ["ALL_PROXY"] = _proxy_url
-    logging.getLogger("bot").info("✅ Proxy configured: %s", _proxy_url.split("@")[-1])
+    
+    if "@" in _proxy_url:
+        parts = _proxy_url.split("@")
+        proxy_host = parts[-1] if len(parts) > 1 else _proxy_url
+    else:
+        proxy_host = _proxy_url
+    logging.getLogger("bot").info("✅ Proxy configured: %s", proxy_host)
 else:
     logging.getLogger("bot").warning(
         "⚠️  HTTP_PROXY / HTTPS_PROXY not set — Railway-ல் proxy variable add செய்யுங்கள்!"
@@ -615,6 +621,8 @@ def _get_env(*names: str, default: str = "") -> str:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 class Cfg:
+    BOT_VERSION = "v1.4.0-R5"
+    
     # Angel One — accepts both short and long env var names
     API_KEY     = _get_env("API_KEY",     "ANGEL_API_KEY")
     CLIENT_ID   = _get_env("CLIENT_ID",   "ANGEL_CLIENT_ID")
@@ -631,6 +639,10 @@ class Cfg:
     MAX_DAILY_LOSS = float(_get_env("MAX_DAILY_LOSS", default="1000"))
     DAILY_TARGET   = float(_get_env("DAILY_TARGET",   default="1500"))
     LOT_SIZE       = int(_get_env("LOT_SIZE",         default="1"))
+
+    # ── Advanced Trading Settings ───────────────────────────────────────────
+    ORDER_STATUS_TIMEOUT = int(_get_env("ORDER_STATUS_TIMEOUT", default="8"))
+    ORDER_RETRIES        = int(_get_env("ORDER_RETRIES",        default="8"))
 
     # ── Capital Protection Settings ─────────────────────────────────────────
     MAX_DAILY_TRADES    = int(_get_env("MAX_DAILY_TRADES",    default="2"))    # max trades/day
@@ -657,6 +669,8 @@ def _now_label() -> str:
 
 
 def _is_trading_hours() -> bool:
+    if datetime.now(IST).weekday() >= 5:
+        return False
     t = _hhmm()
     return Cfg.TRADE_START <= t <= Cfg.TRADE_END
 
@@ -955,7 +969,7 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
         # ── Poll OrderBook to ensure fill ──
         final_filled = 0
         final_price  = 0.0
-        for _ in range(8):
+        for _ in range(Cfg.ORDER_STATUS_TIMEOUT):
             await asyncio.sleep(1.0)
             status_data = await loop.run_in_executor(None, lambda: angel.get_order_status(order_id))
             if status_data:
@@ -1004,6 +1018,56 @@ class TelegramNotifier:
     async def alert_error(self, component: str, error: str) -> None:
         await self.send(f"🚨 *ERROR* — `{component}`\n`{error}`")
 
+class MetricsCollector:
+    def __init__(self) -> None:
+        self.trade_times: List[float] = []
+        self.wins = 0
+        self.losses = 0
+
+    def record_trade(self, entry_time_str: str, pnl: float) -> None:
+        try:
+            entry_time = datetime.fromisoformat(entry_time_str)
+            execution_time = (datetime.now(IST) - entry_time).total_seconds()
+            self.trade_times.append(execution_time)
+        except Exception:
+            pass
+        if pnl > 0: self.wins += 1
+        elif pnl < 0: self.losses += 1
+
+    def get_win_rate(self) -> float:
+        total = self.wins + self.losses
+        return round((self.wins / total * 100), 2) if total > 0 else 0.0
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 3, timeout_sec: int = 60) -> None:
+        self.failures = 0
+        self.last_failure = 0.0
+        self.state = "CLOSED"
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout_sec
+
+    async def execute(self, coro_func: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.state == "OPEN":
+            if time.time() - self.last_failure > self.timeout:
+                self.state = "HALF_OPEN"
+                logger.warning("🛡️ Circuit Breaker HALF-OPEN — Attempting recovery order.")
+            else:
+                raise RuntimeError("Circuit breaker OPEN: Angel API repeatedly failing.")
+        try:
+            result = await coro_func(*args, **kwargs)
+            if self.state == "HALF_OPEN":
+                self.state = "CLOSED"
+                self.failures = 0
+                logger.info("🛡️ Circuit Breaker CLOSED — Connectivity restored.")
+            return result
+        except Exception as e:
+            self.failures += 1
+            self.last_failure = time.time()
+            if self.failures >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.error("🛡️ CIRCUIT BREAKER TRIPPED! Angel API banned or failing!")
+            raise e
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Trading Engine
@@ -1018,6 +1082,8 @@ class TradingEngine:
         self.tg         = TelegramNotifier(Cfg.TELEGRAM_TOKEN, Cfg.TELEGRAM_CHAT_ID)
         self.state      = StateStore(Cfg.STATE_FILE)
         self.strategy   = AlphaStrategy(bypass_time_filter=not bool(Cfg.API_KEY))
+        self.metrics    = MetricsCollector()
+        self.order_circuit = CircuitBreaker()
         self.indicators: Dict[str, IndicatorEngine] = {}
         self._scrip_rows: List[Dict] = []
         self._spot_ltp: Dict[str, float] = {}
@@ -1067,7 +1133,7 @@ class TradingEngine:
             await self.tg.alert_error("SCRIP_MASTER", str(exc))
 
         await self.tg.send(
-            f"🤖 *Ultra-Fast Algo Bot Started*\n"
+            f"🤖 *Ultra-Fast Algo Bot Started (`{Cfg.BOT_VERSION}`)*\n"
             f"Mode: `{self._trade_mode_confirmed.upper()}`  Underlying: `{Cfg.UNDERLYING}`\n"
             f"Capital: ₹{Cfg.CAPITAL:,.0f}  MaxLoss: ₹{Cfg.MAX_DAILY_LOSS:,.0f}\n"
             f"Target: ₹{Cfg.DAILY_TARGET:,.0f}  Lot: {Cfg.LOT_SIZE}\n"
@@ -1281,7 +1347,7 @@ class TradingEngine:
             logger.info("WebSocket connected ✅ — subscribing to %s", spot_token)
             # BUG FIX: subscribe() is a method of SmartWebSocketV2, NOT wsapp.
             # wsapp is the underlying websocket-client WebSocketApp object.
-            if sub_payload and self._ws:
+            if sub_payload and self._ws and hasattr(self._ws, "socket") and self._ws.socket:
                 try:
                     self._ws.subscribe("bot1", 3, sub_payload)
                     logger.info("📡 Subscribed to BankNifty feed (token=%s)", spot_token)
@@ -1462,7 +1528,9 @@ class TradingEngine:
             qty = safe_lots * raw_lot_sz
             logger.info("📐 Sizing: Lots=%d (Risk Bound) Qty=%d", safe_lots, qty)
 
-            order_id, filled_qty, avg_price = await place_limit_order(self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed)
+            order_id, filled_qty, avg_price = await self.order_circuit.execute(
+                place_limit_order, self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed
+            )
             sl       = _sl_price_dynamic(avg_price, atr=signal.entry_atr)
 
             trade = ActiveTrade(
@@ -1560,8 +1628,8 @@ class TradingEngine:
 
             for attempt in range(3):
                 try:
-                    _oid, sold_qty, avg_prc = await place_limit_order(
-                        self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
+                    _oid, sold_qty, avg_prc = await self.order_circuit.execute(
+                        place_limit_order, self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
                     )
                     if sold_qty > 0:
                         weighted_prc += (sold_qty * avg_prc)
@@ -1583,6 +1651,7 @@ class TradingEngine:
             
             # === 📉 Book-keeping Block ===
             pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
+            self.metrics.record_trade(trade.entry_time, pnl)
 
             if rem_qty > 0:
                 trade.lot_size = rem_qty
@@ -1835,6 +1904,7 @@ class TradingEngine:
             f"Balance: ₹{bal:,.0f}\n"
             f"Today P&L: ₹{self.state.daily_pnl:+.0f}\n"
             f"Trades today: {self.state.trade_count}\n"
+            f"Win Rate: {self.metrics.get_win_rate()}%\n"
             f"Active Trade: {trade_info}\n"
             f"Armed: {'✅' if self._trade_armed else '❌'} ({mode_str})\n"
             f"Market Health: {mhi['label']} (score={mhi['score']})\n"
@@ -1936,7 +2006,8 @@ class TradingEngine:
         name = user.first_name if user else "Trader"
         await update.message.reply_text(
             f"👋 *வணக்கம் {name}!*\n\n"
-            f"🤖 Ultra-Fast Algo Bot இயங்குகிறது!\n\n"
+            f"🤖 Ultra-Fast Algo Bot (`{Cfg.BOT_VERSION}`) இயங்குகிறது!\n\n"
+            f"Mode: `{self._trade_mode_confirmed.upper()}`\n"
             f"Underlying: `{Cfg.UNDERLYING}`\n"
             f"Capital: ₹{Cfg.CAPITAL:,.0f}\n\n"
             f"Commands பார்க்க /help அனுப்பவும்\n"
