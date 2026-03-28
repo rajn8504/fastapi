@@ -616,6 +616,7 @@ class Cfg:
     MIN_SIGNAL_STRENGTH = int(_get_env("MIN_SIGNAL_STRENGTH", default="75"))   # min strength to trade
     CONSEC_LOSS_STOP    = int(_get_env("CONSEC_LOSS_STOP",    default="2"))    # stop after N consecutive losses
     PROFIT_LOCK_AT      = float(_get_env("PROFIT_LOCK_AT",    default="500"))  # lock profits (tighten SL) above this
+    SLIPPAGE_BUFFER     = float(_get_env("SLIPPAGE_BUFFER",   default="3.0"))  # padding for limit order execution
 
     UNDERLYING  = _get_env("UNDERLYING",  default="BANKNIFTY")
     TRADE_MODE  = _get_env("TRADE_MODE",  default="paper").lower()
@@ -784,9 +785,22 @@ class AngelClient:
         self.ensure_session()
         if not self._client:
             raise RuntimeError("Client not initialized")
-        resp     = self._client.placeOrder(params)
-        order_id = str(resp["data"]["orderid"])
-        return order_id
+        
+        for attempt in range(3):
+            try:
+                resp = self._client.placeOrder(params)
+                if not resp or not resp.get("status"):
+                    # Capture Angel One explicit rejection
+                    raise RuntimeError(f"Order rejected internally: {resp}")
+                if not resp.get("data") or "orderid" not in resp["data"]:
+                    raise RuntimeError(f"Invalid API response (no orderid): {resp}")
+                return str(resp["data"]["orderid"])
+            except Exception as exc:
+                if attempt == 2:
+                    raise RuntimeError(f"Failed after 3 retries: {exc}")
+                logger.warning("placeOrder attempt %d failed: %s. Retrying in 1s...", attempt + 1, exc)
+                time.sleep(1.0)
+        return ""
 
     def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
         self.ensure_session()
@@ -853,7 +867,9 @@ def find_atm_option(rows: List[Dict], underlying: str, spot: float,
 
 async def place_limit_order(angel: AngelClient, symbol: str, token: str,
                              qty: int, action: str, ltp: float,
-                             buffer: float = 2.0) -> str:
+                             buffer: float = -1.0) -> str:
+    if buffer < 0:
+        buffer = Cfg.SLIPPAGE_BUFFER
     price  = _round_tick(ltp + buffer if action == "BUY" else ltp - buffer)
     params = {
         "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token,
@@ -865,8 +881,12 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
         sim_id = f"PAPER_{int(time.time() * 1000)}"
         logger.info("[PAPER] %s %s qty=%d @%.2f", action, symbol, qty, price)
         return sim_id
+    
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: angel.place_order(params))
+    try:
+        return await loop.run_in_executor(None, lambda: angel.place_order(params))
+    except Exception as exc:
+        raise RuntimeError(f"Angel One API Order Error: {exc}")
 
 
 # ── Telegram notifier ─────────────────────────────────────────────────────────
