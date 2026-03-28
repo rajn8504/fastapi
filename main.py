@@ -1361,10 +1361,21 @@ async def _async_main() -> None:
     if tg_app:
         logger.info("Initialising Telegram application...")
         await tg_app.initialize()
+
+        # Railway redeploy-ல் பழைய container சில seconds வரை run ஆகும்.
+        # deleteWebhook + சிறு delay → Conflict error தவிர்க்கும்.
+        try:
+            await tg_app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("🔄 Webhook deleted — waiting 3s for old instance to exit...")
+        except Exception as _e:
+            logger.warning("delete_webhook failed (harmless): %s", _e)
+        await asyncio.sleep(3)  # old container-க்கு exit time கொடு
+
         await tg_app.start()
         await tg_app.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
+            error_callback=lambda exc: logger.warning("Polling error (auto-retry): %s", exc),
         )
         logger.info("✅ Telegram polling ACTIVE — send /start to your bot now")
     else:
