@@ -639,6 +639,7 @@ class Cfg:
     MAX_DAILY_LOSS = float(_get_env("MAX_DAILY_LOSS", default="1000"))
     DAILY_TARGET   = float(_get_env("DAILY_TARGET",   default="1500"))
     LOT_SIZE       = int(_get_env("LOT_SIZE",         default="1"))
+    RISK_PER_TRADE_PCT = float(_get_env("RISK_PER_TRADE_PCT", default="1.5"))
 
     # ── Advanced Trading Settings ───────────────────────────────────────────
     ORDER_STATUS_TIMEOUT = int(_get_env("ORDER_STATUS_TIMEOUT", default="8"))
@@ -1220,7 +1221,11 @@ class TradingEngine:
             else:
                 drift = rng.uniform(0.001, 0.003)      # strong trend → RSI rises
 
-            self._sim_price = round(self._sim_price * (1 + drift), 2)
+            # Simulate realistic bid-ask spread bounce & occasional micro-gaps
+            bounce = rng.uniform(-0.0003, 0.0003) if (tick_count % 3 != 0) else 0.0
+            gap    = rng.uniform(-0.002, 0.002) if (tick_count % 25 == 0) else 0.0
+
+            self._sim_price = round(self._sim_price * (1 + drift + bounce + gap), 2)
             self._sim_price = max(40000.0, min(70000.0, self._sim_price))
 
             # ── Volume simulation (spike every ~10 candles) ────────────────────
@@ -1519,7 +1524,9 @@ class TradingEngine:
             # ── Dynamic Risk-Based Position Sizing ──
             sl_est = _sl_price_dynamic(opt_ltp, atr=signal.entry_atr)
             risk_per_share = max((opt_ltp - sl_est), 0.10)
-            max_risk_trade = Cfg.MAX_DAILY_LOSS * 0.25  # Max risk per trade: 25% of daily loss limit
+            
+            # Max risk per trade: defaults to 1.5% of absolute capital
+            max_risk_trade = Cfg.CAPITAL * (Cfg.RISK_PER_TRADE_PCT / 100.0) 
             
             lots_by_risk = max(1, int(max_risk_trade / (risk_per_share * raw_lot_sz)))
             lots_by_capital = max(1, int(Cfg.CAPITAL / (opt_ltp * raw_lot_sz)))
