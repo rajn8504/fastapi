@@ -742,6 +742,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
+# Silence noisy HTTP request logs from Telegram polling
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── Static IP Proxy Setup (Railway → AngelOne API) ────────────────────────────
 # Railway-ல் HTTP_PROXY மற்றும் HTTPS_PROXY variable செட் செய்யப்பட்டால்
 # அனைத்து outgoing requests-உம் proxy வழியாக செல்லும் (Static IP கிடைக்கும்)
@@ -2197,6 +2201,19 @@ class TradingEngine:
             parse_mode="Markdown",
         )
 
+    async def _get_armed_status_reason(self) -> str:
+        spot = self._spot_ltp.get(Cfg.UNDERLYING, 0)
+        token = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+        ind = self.indicators.get(token)
+        if not ind or spot <= 0 or ind.num_candles < 5:
+            return "\n⏳ *Warming Up:* போதிய மார்க்கெட் டேட்டா இன்னும் கிடைக்கவில்லை. டேட்டா சேர்ந்ததும் நான் தேடத் தொடங்குவேன்..."
+        
+        result = self.strategy.evaluate(spot, ind)
+        if result.signal == "NONE":
+            return f"\n🔍 *Current Block:* {result.reason}\n\n🦅 கண்கொத்திப் பாம்பாக மார்க்கெட்டை கவனித்து வருகிறேன்! சாதகமான சூழல் வந்தவுடன் உடனடியாக Trade எடுக்கப்படும்."
+        else:
+            return f"\n🔥 *{result.signal} Signal Active!* (Strength: {result.strength}%)\nஉடனடியாக Trade எடுக்கப்படுகிறது!"
+
     async def cmd_starttrade(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kbd = [
             [InlineKeyboardButton("📄 Paper Trade", callback_data="confirm_paper"),
@@ -2214,15 +2231,16 @@ class TradingEngine:
         if q.data == "confirm_paper":
             self._trade_mode_confirmed = "paper"
             self._trade_armed = True
-            await q.edit_message_text("✅ *Paper trading armed.*", parse_mode="Markdown")
+            reason_msg = await self._get_armed_status_reason()
+            await q.edit_message_text(f"✅ *Paper trading armed.*\n{reason_msg}", parse_mode="Markdown")
         elif q.data == "confirm_live":
             if not Cfg.API_KEY:
                 await q.edit_message_text("❌ API_KEY not configured.", parse_mode="Markdown")
                 return
             self._trade_mode_confirmed = "live"
             self._trade_armed = True
-            await q.edit_message_text("🚨 *LIVE trading armed.* Real orders will be placed.",
-                                       parse_mode="Markdown")
+            reason_msg = await self._get_armed_status_reason()
+            await q.edit_message_text(f"🚨 *LIVE trading armed.*\n{reason_msg}", parse_mode="Markdown")
         elif q.data == "cancel_trade":
             self._trade_armed = False
             await q.edit_message_text("❌ Cancelled.")
