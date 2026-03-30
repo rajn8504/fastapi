@@ -826,6 +826,7 @@ class AngelClient:
         self.auth_token  = ""
         self.feed_token  = ""
         self._login_time = 0.0
+        self._session_lock = __import__("threading").Lock()  # ✅ Fix #1: Thread-safe login
 
     def login(self) -> bool:
         try:
@@ -844,8 +845,13 @@ class AngelClient:
             return False
 
     def ensure_session(self) -> None:
+        # ✅ Fix #1: Only one thread can refresh the session at a time
         if time.time() - self._login_time > 21600:
-            self.login()
+            with self._session_lock:
+                # Double-check after acquiring lock (another thread may have refreshed)
+                if time.time() - self._login_time > 21600:
+                    logger.info("🔄 Session expired — re-logging in...")
+                    self.login()
 
     def place_order(self, params: Dict[str, Any]) -> str:
         self.ensure_session()
@@ -1655,24 +1661,30 @@ class TradingEngine:
                 return
 
             final_exit_price = round(weighted_prc / total_sold, 2)
-            
-            # === 📉 Book-keeping Block ===
+
+            # === 📉 Book-keeping Block (sold qty பொறுத்து P&L) ===
             pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
             self.metrics.record_trade(trade.entry_time, pnl)
 
             if rem_qty > 0:
+                # ✅ Fix #4: Partial fill — update lot_size & notify; keep active_trade alive
+                # for remaining qty to be monitored / exited later
                 trade.lot_size = rem_qty
                 if self._trailing:
                     self._trailing.lot_size = rem_qty
                 self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
                 await self.state.save()
+                logger.warning("⚠️ Partial exit: sold=%d stranded=%d @₹%.2f",
+                                total_sold, rem_qty, final_exit_price)
                 await self.tg.send(
                     f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
                     f"`{trade.symbol}` Exit Avg: ₹{final_exit_price:.2f}\n"
                     f"Sold: {total_sold} | Stranded: {rem_qty}\n"
-                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
+                    f"P&L (partial): ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                    f"⚠️ *{rem_qty} qty இன்னும் open* — /exitnow மீண்டும் இயக்கவும்!"
                 )
             else:
+                # ✅ Fix #4: Complete exit — clear active_trade fully & unsubscribe WS
                 # 📡 Unsubscribe Option Token (ONLY ON COMPLETE FULL EXIT)
                 if self._ws:
                     try:
@@ -1682,24 +1694,34 @@ class TradingEngine:
                         if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
                         self._ws.subscribe("bot_spot", 3, sub_p)
                         logger.info("📡 Live WS Reverted to Spot only.")
-                    except Exception as wse:
+                    except Exception:
                         pass
-                        
+
                 await self.state.record_closed_trade(pnl)
                 self._trailing = None
+                # Explicitly clear option LTP cache for this token
+                self._option_ltp.pop(trade.token, None)
+                self._last_pct_notify.pop(trade.token, None)
                 await self.state.save()
 
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 await self.tg.send(
                     f"{emoji} *TRADE CLOSED* — {reason}\n"
                     f"`{trade.symbol}` Exit: ₹{final_exit_price:.2f}\n"
-                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}"
+                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                    f"Win Rate: {self.metrics.get_win_rate():.1f}%"
                 )
                 if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
                     self._trade_armed = False
                     await self.tg.send(
                         "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
                         f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                    )
+                elif self.state.daily_pnl >= Cfg.DAILY_TARGET:
+                    self._trade_armed = False
+                    await self.tg.send(
+                        "🎯 *DAILY TARGET HIT* — Bot disarmed. நல்ல வேலை!\n"
+                        f"Total Profit: ₹{self.state.daily_pnl:.0f}"
                     )
         finally:
             self._exit_in_progress = False
@@ -1729,27 +1751,46 @@ class TradingEngine:
 
     async def _maybe_notify_price_move(self, token: str, ltp: float) -> None:
         last = self._last_pct_notify.get(token, ltp)
-        if last > 0 and abs((ltp - last) / last) * 100 >= 1.0:
+        # ✅ Fix #5: Options-க்கு 2% threshold — 1% = அதிக noise notifications
+        if last > 0 and abs((ltp - last) / last) * 100 >= 2.0:
             self._last_pct_notify[token] = ltp
+            pct = round((ltp - last) / last * 100, 1)
             d = "📈" if ltp > last else "📉"
             await self.tg.send(
-                f"{d} *1% Move* `{token}` ₹{last:.2f}→₹{ltp:.2f}"
+                f"{d} *{abs(pct):.1f}% Move* `{token}` ₹{last:.2f}→₹{ltp:.2f}"
             )
 
     # ── Maintenance loop ──────────────────────────────────────────────────────
 
     async def _maintenance_loop(self) -> None:
+        _eod_squared_off_today = ""   # ✅ Fix #2: track date to avoid duplicate EOD exits
         while self._running:
             try:
                 await self.state.check_day_rollover()
-                if _hhmm() == 1425 and self.state.active_trade:
+                today = datetime.now(IST).strftime("%Y-%m-%d")
+
+                # ✅ Fix #2: Use >= range (not ==) so 30s sleep never misses 14:25
+                # ✅ Fix #3: Warn clearly if live LTP unavailable instead of silently using entry_price
+                t_now = _hhmm()
+                if 1425 <= t_now <= 1428 and self.state.active_trade and _eod_squared_off_today != today:
+                    _eod_squared_off_today = today   # mark done for this calendar day
                     t   = self.state.active_trade
-                    ltp = t.entry_price
+                    ltp = 0.0
                     if Cfg.API_KEY and self._loop:
-                        ltp = await self._loop.run_in_executor(
-                            None, lambda: self.angel.get_ltp("NFO", t.symbol, t.token)
-                        )
-                    await self._exit_trade(ltp or t.entry_price, "EOD_SQUARE_OFF")
+                        try:
+                            ltp = await self._loop.run_in_executor(
+                                None, lambda: self.angel.get_ltp("NFO", t.symbol, t.token)
+                            )
+                        except Exception as ltp_err:
+                            logger.warning("⚠️ EOD LTP fetch failed (%s) — using last known option LTP", ltp_err)
+                    # Fallback priority: live LTP → last WS tick → entry price (last resort)
+                    if ltp <= 0:
+                        ltp = self._option_ltp.get(t.token, 0.0)
+                    if ltp <= 0:
+                        ltp = t.entry_price
+                        logger.warning("⚠️ EOD: No live LTP available — exiting at entry price ₹%.2f (may be inaccurate)", ltp)
+                    await self._exit_trade(ltp, "EOD_SQUARE_OFF")
+
                 await self.state.save()
             except Exception as exc:
                 logger.error("Maintenance error: %s", exc)
