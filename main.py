@@ -541,6 +541,11 @@ class AlphaStrategy:
 
     def evaluate(self, ltp: float, indicator: IndicatorEngine) -> SignalResult:
         t0         = time.time()
+        
+        # Layer 1: Kalman filtered price for all signal logic (noise reduction)
+        if indicator.kalman_price > 0:
+            ltp = indicator.kalman_price
+            
         vwap       = indicator.vwap
         rsi        = indicator.rsi
         st_dir     = indicator.supertrend_direction
@@ -586,8 +591,9 @@ class AlphaStrategy:
 
         # ── CALL ─────────────────────────────────────────────────────────────
         if st_dir == "UP" and ema_bull and above_vwap and rsi >= self.RSI_CALL_MIN:
-            if ema_slope < 1.0:
-                return _no(f"ST=UP ✓ — blocked: flat EMA slope ({ema_slope}) indicates whipsaw")
+            min_slope = 0.0005 * ltp
+            if ema_slope < min_slope:
+                return _no(f"ST=UP ✓ — blocked: flat EMA slope ({ema_slope:.2f}<{min_slope:.2f}) indicates whipsaw")
             if not vol_spike:
                 return _no(f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.CALL_BLOCK_PATTERNS:
@@ -614,8 +620,9 @@ class AlphaStrategy:
 
         # ── PUT ──────────────────────────────────────────────────────────────
         if st_dir == "DOWN" and not ema_bull and not above_vwap and rsi <= self.RSI_PUT_MAX:
-            if ema_slope > -1.0:
-                return _no(f"ST=DOWN ✓ — blocked: flat EMA slope ({ema_slope}) indicates whipsaw")
+            min_slope = 0.0005 * ltp
+            if ema_slope > -min_slope:
+                return _no(f"ST=DOWN ✓ — blocked: flat EMA slope ({ema_slope:.2f}>{-min_slope:.2f}) indicates whipsaw")
             if not vol_spike:
                 return _no(f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.PUT_BLOCK_PATTERNS:
@@ -771,7 +778,7 @@ def _get_env(*names: str, default: str = "") -> str:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 class Cfg:
-    BOT_VERSION = "v1.4.0-R5"
+    BOT_VERSION = "v1.5.0-Institutional"
     
     # Angel One — accepts both short and long env var names
     API_KEY     = _get_env("API_KEY",     "ANGEL_API_KEY")
@@ -1730,6 +1737,7 @@ class TradingEngine:
             self._trailing = TrailingState(
                 entry_price=avg_price, current_sl=sl,
                 high_water=avg_price, lot_size=filled_qty,
+                trail_step_price=max(2.0, signal.entry_atr * 0.5)
             )
             await self.state.save()
 
