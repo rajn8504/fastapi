@@ -542,19 +542,19 @@ class AlphaStrategy:
     def evaluate(self, ltp: float, indicator: IndicatorEngine) -> SignalResult:
         t0         = time.time()
         
-        # Layer 1: Kalman filtered price for all signal logic (noise reduction)
-        if indicator.kalman_price > 0:
-            ltp = indicator.kalman_price
-            
+        # Layer 1: Kalman filtered price for all signal logic
+        price = indicator.kalman_price if indicator.kalman_price > 0 else ltp
+
         vwap       = indicator.vwap
         rsi        = indicator.rsi
         st_dir     = indicator.supertrend_direction
-        above_vwap = ltp > vwap if vwap > 0 else False
+        above_vwap = price > vwap if vwap > 0 else False
         vol_spike  = indicator.volume_spike()
         adx        = indicator.adx
         ema_bull   = indicator.ema_bullish
         ema_slope  = indicator.ema_fast_slope
         pattern    = indicator.last_candle_pattern
+        atr        = indicator.current_atr
 
         def _no(reason: str) -> SignalResult:
             return SignalResult(signal="NONE", strength=0, reason=reason,
@@ -587,20 +587,20 @@ class AlphaStrategy:
 
         # Layer 6: Dynamic pullback threshold = max(0.3%, ATR×0.1/price)
         atr = indicator.current_atr
-        pullback_th = max(0.003, (atr * 0.1 / ltp) if ltp > 0 else 0.003)
+        pullback_th = max(0.003, (atr * 0.1 / price) if price > 0 else 0.003)
 
         # ── CALL ─────────────────────────────────────────────────────────────
         if st_dir == "UP" and ema_bull and above_vwap and rsi >= self.RSI_CALL_MIN:
-            min_slope = 0.0005 * ltp
-            if ema_slope < min_slope:
-                return _no(f"ST=UP ✓ — blocked: flat EMA slope ({ema_slope:.2f}<{min_slope:.2f}) indicates whipsaw")
+            slope_threshold = 0.0005 * price
+            if ema_slope < slope_threshold:
+                return _no(f"ST=UP ✓ — flat EMA slope ({ema_slope:.2f}<{slope_threshold:.2f}) whipsaw risk")
             if not vol_spike:
                 return _no(f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.CALL_BLOCK_PATTERNS:
                 return _no(f"ST=UP — blocked by {pattern}")
             # Layer 6a: Pullback guard — not chasing overextended move
             if indicator.ema_fast > 0:
-                overshoot = (ltp - indicator.ema_fast) / indicator.ema_fast
+                overshoot = (price - indicator.ema_fast) / indicator.ema_fast
                 if overshoot > pullback_th * 2:
                     return _no(f"CALL overextended {overshoot:.2%} above EMA9 >limit {pullback_th*2:.2%}")
             # Layer 6b: Range momentum — candle must show energy
@@ -620,16 +620,16 @@ class AlphaStrategy:
 
         # ── PUT ──────────────────────────────────────────────────────────────
         if st_dir == "DOWN" and not ema_bull and not above_vwap and rsi <= self.RSI_PUT_MAX:
-            min_slope = 0.0005 * ltp
-            if ema_slope > -min_slope:
-                return _no(f"ST=DOWN ✓ — blocked: flat EMA slope ({ema_slope:.2f}>{-min_slope:.2f}) indicates whipsaw")
+            slope_threshold = 0.0005 * price
+            if ema_slope > -slope_threshold:
+                return _no(f"ST=DOWN ✓ — flat EMA slope ({ema_slope:.2f}>{-slope_threshold:.2f}) whipsaw risk")
             if not vol_spike:
                 return _no(f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.PUT_BLOCK_PATTERNS:
                 return _no(f"ST=DOWN — blocked by {pattern}")
             # Layer 6a: Pullback guard
             if indicator.ema_fast > 0:
-                overshoot = (indicator.ema_fast - ltp) / indicator.ema_fast
+                overshoot = (indicator.ema_fast - price) / indicator.ema_fast
                 if overshoot > pullback_th * 2:
                     return _no(f"PUT overextended {overshoot:.2%} below EMA9 >limit {pullback_th*2:.2%}")
             # Layer 6b: Range momentum
@@ -658,7 +658,7 @@ class TrailingState:
     high_water:       float
     lot_size:         int
     is_breakeven:     bool  = False
-    trail_step_price: float = 100.0
+    trail_step_price: float = 50.0  # Dynamic per trade, default 50
 
     BREAKEVEN_TRIGGER_PNL = 300.0
     TRAIL_TRIGGER_PNL     = 700.0
@@ -1737,7 +1737,7 @@ class TradingEngine:
             self._trailing = TrailingState(
                 entry_price=avg_price, current_sl=sl,
                 high_water=avg_price, lot_size=filled_qty,
-                trail_step_price=max(2.0, signal.entry_atr * 0.5)
+                trail_step_price=max(50.0, signal.entry_atr * 0.5)
             )
             await self.state.save()
 
