@@ -115,6 +115,26 @@ class IndicatorEngine:
         # Candle pattern
         self._last_pattern: str = "NONE"
 
+        # ── Layer 1: Kalman Filter ────────────────────────────────────────────
+        self._kalman_x: float = 0.0      # estimated price
+        self._kalman_P: float = 1.0      # error covariance
+        self._kalman_Q: float = 0.001    # process noise
+        self._kalman_R: float = 0.01     # measurement noise
+
+        # ── Layer 4: M15 Multi-Timeframe Builder ─────────────────────────────
+        self._m15cs: int = 900           # 15-min in seconds
+        self._m15_open: float = 0.0
+        self._m15_high: float = 0.0
+        self._m15_low: float  = float("inf")
+        self._m15_close: float = 0.0
+        self._m15_cstart: float = 0.0
+        self._m15_candles: Deque[Candle] = collections.deque(maxlen=30)
+        self._m15_atr_v: Deque[float]   = collections.deque(maxlen=self.SUPERTREND_PERIOD)
+        self._m15_atr_s: Optional[float] = None
+        self._m15_st_up: Optional[float] = None
+        self._m15_st_lo: Optional[float] = None
+        self._m15_st_dir: str = "UP"
+
     # ── VWAP ─────────────────────────────────────────────────────────────────
 
     def _maybe_reset_vwap(self, ts_sec: float) -> None:
@@ -238,26 +258,43 @@ class IndicatorEngine:
 
     def on_tick(self, tick: Tick) -> Optional[Candle]:
         ts_sec = tick.timestamp_ms / 1000.0
+        price  = tick.ltp
+        vol    = max(0, tick.volume)
         self._maybe_reset_vwap(ts_sec)
-        self._vwap_cum_pv += tick.ltp * max(0, tick.volume)
-        self._vwap_cum_v  += max(0, tick.volume)
+        self._vwap_cum_pv += price * vol
+        self._vwap_cum_v  += vol
 
+        # Layer 1: Kalman smoothing
+        self._kalman_update(price)
+
+        # 5-min candle builder
         bucket = self._candle_start(ts_sec)
         if self._cur_candle_start == 0.0:
             self._cur_candle_start = bucket
-
         completed: Optional[Candle] = None
         if bucket != self._cur_candle_start:
             completed = self._flush_candle()
             self._cur_candle_start = bucket
-
-        price = tick.ltp
         if self._cur_open == 0.0:
             self._cur_open = price
         self._cur_high   = max(self._cur_high, price)
         self._cur_low    = min(self._cur_low,  price)
         self._cur_close  = price
-        self._cur_volume += max(0, tick.volume)
+        self._cur_volume += vol
+
+        # Layer 4: M15 candle builder
+        m15b = ts_sec - (ts_sec % self._m15cs)
+        if self._m15_cstart == 0.0:
+            self._m15_cstart = m15b
+        if m15b != self._m15_cstart:
+            self._m15_flush()
+            self._m15_cstart = m15b
+        if self._m15_open == 0.0:
+            self._m15_open = price
+        self._m15_high  = max(self._m15_high, price)
+        self._m15_low   = min(self._m15_low,  price)
+        self._m15_close = price
+
         return completed
 
     # ── Volume spike ──────────────────────────────────────────────────────────
@@ -389,6 +426,91 @@ class IndicatorEngine:
     def last_candle_pattern(self) -> str:
         return self._last_pattern
 
+    # ── Layer 1: Kalman Filter ────────────────────────────────────────────────
+
+    def _kalman_update(self, price: float) -> None:
+        if self._kalman_x == 0.0:
+            self._kalman_x = price
+            return
+        P_pred = self._kalman_P + self._kalman_Q
+        K = P_pred / (P_pred + self._kalman_R)
+        self._kalman_x += K * (price - self._kalman_x)
+        self._kalman_P  = (1.0 - K) * P_pred
+
+    @property
+    def kalman_price(self) -> float:
+        """Kalman-smoothed price (noise-reduced)."""
+        return round(self._kalman_x, 2)
+
+    # ── Layer 4: M15 Supertrend ───────────────────────────────────────────────
+
+    def _m15_flush(self) -> None:
+        if self._m15_open == 0.0:
+            return
+        c = Candle(
+            timestamp=self._m15_cstart,
+            open=self._m15_open, high=self._m15_high,
+            low=self._m15_low,   close=self._m15_close,
+            volume=0,
+        )
+        self._m15_candles.append(c)
+        self._m15_update_supertrend(c)
+        self._m15_open  = 0.0
+        self._m15_high  = 0.0
+        self._m15_low   = float("inf")
+        self._m15_close = 0.0
+
+    def _m15_update_supertrend(self, candle: Candle) -> None:
+        if len(self._m15_candles) < 2:
+            return
+        prev = self._m15_candles[-2]
+        tr   = self._true_range(candle, prev.close)
+        n    = self.SUPERTREND_PERIOD
+        if self._m15_atr_s is None:
+            self._m15_atr_v.append(tr)
+            if len(self._m15_atr_v) >= n:
+                self._m15_atr_s = sum(self._m15_atr_v) / n
+        else:
+            self._m15_atr_s = (self._m15_atr_s * (n - 1) + tr) / n
+        if self._m15_atr_s is None:
+            return
+        mid   = (candle.high + candle.low) / 2.0
+        m     = self.SUPERTREND_MULTIPLIER
+        bu    = mid + m * self._m15_atr_s
+        bl    = mid - m * self._m15_atr_s
+        pu    = self._m15_st_up if self._m15_st_up is not None else bu
+        pl    = self._m15_st_lo if self._m15_st_lo is not None else bl
+        fu    = bu if (bu < pu or prev.close > pu) else pu
+        fl    = bl if (bl > pl or prev.close < pl) else pl
+        if self._m15_st_dir == "UP":
+            if candle.close < fl:
+                self._m15_st_dir = "DOWN"
+        else:
+            if candle.close > fu:
+                self._m15_st_dir = "UP"
+        self._m15_st_up = fu
+        self._m15_st_lo = fl
+
+    @property
+    def m15_supertrend_direction(self) -> str:
+        return self._m15_st_dir
+
+    @property
+    def m15_num_candles(self) -> int:
+        return len(self._m15_candles)
+
+    # ── Layer 6: Range Ratio ─────────────────────────────────────────────────
+
+    @property
+    def range_ratio(self) -> float:
+        """Current incomplete candle range vs avg of last 5 completed candles."""
+        if len(self._candles) < 5:
+            return 1.0
+        recent  = list(self._candles)[-5:]
+        avg_rng = sum(max(c.high - c.low, 0.01) for c in recent) / len(recent)
+        cur_rng = max(self._cur_high - self._cur_low, 0.0) if self._cur_high > 0 else 0.0
+        return round(cur_rng / avg_rng, 2) if avg_rng > 0 else 1.0
+
 
 class AlphaStrategy:
     """
@@ -449,6 +571,18 @@ class AlphaStrategy:
 
         if adx > 0 and adx < self.ADX_MIN:
             return _no(f"Market sideways — ADX={adx:.1f}<{self.ADX_MIN}")
+        # Layer 3: ADX tier boost (>25=+5, >30=+15 to signal strength)
+        adx_boost = 15 if adx >= 30 else (5 if adx >= 25 else 0)
+
+        # Layer 4: M15 Multi-Timeframe alignment (skip until M15 warmed up)
+        m15_dir = indicator.m15_supertrend_direction
+        if indicator.m15_num_candles >= IndicatorEngine.SUPERTREND_PERIOD + 2:
+            if st_dir != m15_dir:
+                return _no(f"MTF mismatch: M5={st_dir} vs M15={m15_dir} — no alignment")
+
+        # Layer 6: Dynamic pullback threshold = max(0.3%, ATR×0.1/price)
+        atr = indicator.current_atr
+        pullback_th = max(0.003, (atr * 0.1 / ltp) if ltp > 0 else 0.003)
 
         # ── CALL ─────────────────────────────────────────────────────────────
         if st_dir == "UP" and ema_bull and above_vwap and rsi >= self.RSI_CALL_MIN:
@@ -458,13 +592,21 @@ class AlphaStrategy:
                 return _no(f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.CALL_BLOCK_PATTERNS:
                 return _no(f"ST=UP — blocked by {pattern}")
+            # Layer 6a: Pullback guard — not chasing overextended move
+            if indicator.ema_fast > 0:
+                overshoot = (ltp - indicator.ema_fast) / indicator.ema_fast
+                if overshoot > pullback_th * 2:
+                    return _no(f"CALL overextended {overshoot:.2%} above EMA9 >limit {pullback_th*2:.2%}")
+            # Layer 6b: Range momentum — candle must show energy
+            if indicator.range_ratio < 1.3 and indicator.num_candles >= 10:
+                return _no(f"Weak range={indicator.range_ratio:.2f}x <1.3x avg")
             self._last_signal_time = t0
             strength = min(100, 65 + int((rsi - 55) * 2.5)
                           + (15 if pattern in self.CALL_BOOST_PATTERNS else 0)
-                          + (10 if adx >= 30 else 0))
+                          + adx_boost)
             return SignalResult(
                 signal="CALL", strength=strength,
-                reason=f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} Ptn={pattern} LTP={ltp:.1f}",
+                reason=f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} M15={m15_dir} Ptn={pattern} LTP={ltp:.1f}",
                 supertrend_dir=st_dir, above_vwap=True, rsi=rsi, volume_spike=True,
                 adx=adx, ema_bullish=True, ema_fast_slope=ema_slope, candle_pattern=pattern,
                 entry_atr=indicator.current_atr,
@@ -478,19 +620,27 @@ class AlphaStrategy:
                 return _no(f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.PUT_BLOCK_PATTERNS:
                 return _no(f"ST=DOWN — blocked by {pattern}")
+            # Layer 6a: Pullback guard
+            if indicator.ema_fast > 0:
+                overshoot = (indicator.ema_fast - ltp) / indicator.ema_fast
+                if overshoot > pullback_th * 2:
+                    return _no(f"PUT overextended {overshoot:.2%} below EMA9 >limit {pullback_th*2:.2%}")
+            # Layer 6b: Range momentum
+            if indicator.range_ratio < 1.3 and indicator.num_candles >= 10:
+                return _no(f"Weak range={indicator.range_ratio:.2f}x <1.3x avg")
             self._last_signal_time = t0
             strength = min(100, 65 + int((45 - rsi) * 2.5)
                           + (15 if pattern in self.PUT_BOOST_PATTERNS else 0)
-                          + (10 if adx >= 30 else 0))
+                          + adx_boost)
             return SignalResult(
                 signal="PUT", strength=strength,
-                reason=f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} Ptn={pattern} LTP={ltp:.1f}",
+                reason=f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} M15={m15_dir} Ptn={pattern} LTP={ltp:.1f}",
                 supertrend_dir=st_dir, above_vwap=False, rsi=rsi, volume_spike=True,
                 adx=adx, ema_bullish=False, ema_fast_slope=ema_slope, candle_pattern=pattern,
                 entry_atr=indicator.current_atr,
             )
 
-        return _no(f"No confluence — ST={st_dir} EMA={'bull' if ema_bull else 'bear'} "
+        return _no(f"No confluence — ST={st_dir} M15={m15_dir} EMA={'bull' if ema_bull else 'bear'} "
                    f"RSI={rsi:.1f} ADX={adx:.1f} VWAP={'above' if above_vwap else 'below'}")
 
 
@@ -679,9 +829,11 @@ def _is_trading_hours() -> bool:
 SCRIP_MASTER_URL = (
     "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 )
-STRIKE_STEP = {"BANKNIFTY": 100, "FINNIFTY": 50, "NIFTY": 50}
-SPOT_TOKEN  = {"BANKNIFTY": "26009", "FINNIFTY": "26037", "NIFTY": "26000"}
-TICK_SIZE   = 0.05
+STRIKE_STEP  = {"BANKNIFTY": 100, "FINNIFTY": 50, "NIFTY": 50}
+SPOT_TOKEN   = {"BANKNIFTY": "26009", "FINNIFTY": "26037", "NIFTY": "26000"}
+# Layer 5: Bank leader tokens (NSE) for correlation filter
+BANK_LEADERS = {"HDFCBANK": "1333", "ICICIBANK": "4963"}
+TICK_SIZE    = 0.05
 
 
 def _round_tick(price: float) -> float:
@@ -1106,6 +1258,9 @@ class TradingEngine:
         self._last_pct_notify: Dict[str, float] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._prev_vol: Dict[str, int] = {}  # Delta volume map
+        # Layer 5: Bank leader correlation tracking (HDFC + ICICI)
+        self._bank_ltps:      Dict[str, float] = {}   # current price
+        self._bank_prev_ltps: Dict[str, float] = {}   # price from last maintenance tick
         # Simulation state
         self._sim_price  = 55000.0    # BankNifty base price
         self._sim_volume = 0
@@ -1451,6 +1606,10 @@ class TradingEngine:
         if token == spot_token:
             self._spot_ltp[Cfg.UNDERLYING] = ltp
 
+        # Layer 5: Track bank leader prices for correlation filter
+        if token in BANK_LEADERS.values():
+            self._bank_ltps[token] = ltp
+
         if self.state.active_trade and token == self.state.active_trade.token:
             self._option_ltp[token] = ltp
             await self._maybe_notify_price_move(token, ltp)
@@ -1505,6 +1664,18 @@ class TradingEngine:
             logger.info("🛑 %d consecutive losses — trading stopped for today",
                         self.state.consec_losses)
             return
+        # Gate 4 (Layer 5): Bank leader correlation — at least 1 must confirm
+        if self._bank_ltps and self._bank_prev_ltps:
+            confirms = sum(
+                1 for tok, ltp in self._bank_ltps.items()
+                if (signal.signal == "CALL" and ltp > self._bank_prev_ltps.get(tok, ltp))
+                or (signal.signal == "PUT"  and ltp < self._bank_prev_ltps.get(tok, ltp))
+            )
+            if confirms == 0:
+                logger.info("🛑 Layer5 Correlation: Neither HDFC nor ICICI confirms %s — skip",
+                            signal.signal)
+                return
+            logger.info("📊 Layer5 Correlation: %d/2 bank leaders confirm %s", confirms, signal.signal)
 
         t0 = time.monotonic()
         try:
@@ -1596,21 +1767,31 @@ class TradingEngine:
         trade = self.state.active_trade
         changed, new_sl = self._trailing.update(ltp)
 
-        # ── Profit Lock: when daily P&L crosses PROFIT_LOCK_AT, tighten SL aggressively
+        # Layer 8: Tier-Based Profit Lock
+        # Tier 1 (₹500+): Lock 50% of floating gain
+        # Tier 2 (₹1000+): Lock 70% of floating gain
         pnl_unrealised = self._trailing.unrealised_pnl(ltp)
-        if self.state.daily_pnl + pnl_unrealised >= Cfg.PROFIT_LOCK_AT:
-            # Lock SL at 95% of current price (only 5% give-back allowed)
-            lock_sl = _round_tick(ltp * 0.95)
-            if lock_sl > self._trailing.current_sl:
-                self._trailing.current_sl = lock_sl
-                trade.sl_price            = lock_sl
-                changed                   = True
-                logger.info("🔒 Profit Lock activated: SL locked at ₹%.2f", lock_sl)
-                await self.tg.send(
-                    f"🔒 *Profit Lock Activated!*\n"
-                    f"Daily P&L: ₹{self.state.daily_pnl + pnl_unrealised:+.0f} ≥ ₹{Cfg.PROFIT_LOCK_AT:.0f}\n"
-                    f"SL tightened to ₹{lock_sl:.2f} (5% give-back only)"
-                )
+        lock_sl        = 0.0
+        lock_tier      = ""
+        if pnl_unrealised >= 1000:
+            gain_per_unit = pnl_unrealised * 0.70 / trade.lot_size
+            lock_sl  = _round_tick(trade.entry_price + gain_per_unit)
+            lock_tier = "70%"
+        elif pnl_unrealised >= 500:
+            gain_per_unit = pnl_unrealised * 0.50 / trade.lot_size
+            lock_sl  = _round_tick(trade.entry_price + gain_per_unit)
+            lock_tier = "50%"
+        if lock_sl > self._trailing.current_sl:
+            self._trailing.current_sl = lock_sl
+            trade.sl_price            = lock_sl
+            changed                   = True
+            logger.info("🔒 Tier Profit Lock %s: SL=₹%.2f unrealised=₹%.0f",
+                        lock_tier, lock_sl, pnl_unrealised)
+            await self.tg.send(
+                f"🔒 *Profit Lock {lock_tier}*\n"
+                f"Unrealised P&L: ₹{pnl_unrealised:+.0f}\n"
+                f"SL locked at ₹{lock_sl:.2f}"
+            )
 
         if changed:
             trade.sl_price = self._trailing.current_sl
@@ -1790,6 +1971,31 @@ class TradingEngine:
                         ltp = t.entry_price
                         logger.warning("⚠️ EOD: No live LTP available — exiting at entry price ₹%.2f (may be inaccurate)", ltp)
                     await self._exit_trade(ltp, "EOD_SQUARE_OFF")
+
+                # Layer 9: Smart Time Exit — only for dead/weak trades (>20 min, PnL < ₹150)
+                if self.state.active_trade and not (1425 <= t_now <= 1428):
+                    t = self.state.active_trade
+                    try:
+                        entry_dt  = datetime.fromisoformat(t.entry_time)
+                        elapsed   = (datetime.now(IST) - entry_dt).total_seconds() / 60.0
+                        if elapsed >= 20:
+                            opt_ltp  = self._option_ltp.get(t.token, t.entry_price)
+                            trade_pnl = (opt_ltp - t.entry_price) * t.lot_size
+                            if trade_pnl < 150:
+                                logger.info("⏱ Layer9 Time Exit: %.1f min PnL=₹%.0f — dead trade",
+                                            elapsed, trade_pnl)
+                                await self.tg.send(
+                                    f"⏱ *Time Exit (Layer 9)*\n"
+                                    f"`{t.symbol}` — {elapsed:.0f} min elapsed\n"
+                                    f"P&L: ₹{trade_pnl:+.0f} < ₹150 threshold\n"
+                                    f"Dead trade exiting..."
+                                )
+                                await self._exit_trade(opt_ltp, f"TIME_EXIT_{elapsed:.0f}min")
+                    except Exception as te:
+                        logger.debug("Time exit check failed: %s", te)
+
+                # Layer 5: Update bank prev prices for correlation direction
+                self._bank_prev_ltps.update(self._bank_ltps)
 
                 await self.state.save()
             except Exception as exc:
