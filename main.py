@@ -1312,9 +1312,12 @@ class TradingEngine:
         while dt_from.weekday() > 4:  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
             dt_from -= timedelta(days=1)
             
+        # Angel One Historical API requires '999' prefix for indices (26009 -> 99926009)
+        hist_token = f"999{spot_token}" if spot_token in ["26000", "26009", "26037"] else spot_token
+            
         params = {
             "exchange": "NSE",
-            "symboltoken": spot_token,
+            "symboltoken": hist_token,
             "interval": "FIVE_MINUTE",
             "fromdate": dt_from.strftime("%Y-%m-%d 09:15"),
             "todate": dt_now.strftime("%Y-%m-%d %H:%M")
