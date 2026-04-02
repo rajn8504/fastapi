@@ -727,6 +727,17 @@ import httpx
 import pyotp
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+# --- MONKEY PATCH: Fix websocket-client vs smartapi parameter mismatch ---
+# Newer websocket-client versions pass 4 arguments (self, ws, close_status_code, close_msg)
+# But smartapi-python 1.5.5 expects exactly 2 arguments (self, ws).
+_orig_on_close = getattr(SmartWebSocketV2, "_on_close", None)
+if _orig_on_close:
+    def _patched_on_close(self, ws, *args, **kwargs):
+        return _orig_on_close(self, ws)
+    SmartWebSocketV2._on_close = _patched_on_close
+# -------------------------------------------------------------------------
+
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
