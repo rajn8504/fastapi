@@ -1306,9 +1306,12 @@ class TradingEngine:
         logger.info("⏳ Fetching historical data to warm up indicators...")
         from datetime import timedelta
         dt_now = datetime.now(IST)
-        # Fetch last 4 days to ensure at least 1-2 trading days cover even on Mondays
-        dt_from = dt_now - timedelta(days=4)
         
+        # Fetch ~4 days back, but ensure we don't land on a weekend
+        dt_from = dt_now - timedelta(days=4)
+        while dt_from.weekday() > 4:  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+            dt_from -= timedelta(days=1)
+            
         params = {
             "exchange": "NSE",
             "symboltoken": spot_token,
@@ -1321,12 +1324,12 @@ class TradingEngine:
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(None, self.angel._client.getCandleData, params)
             if not res or not res.get("status"):
-                logger.error("❌ Failed to fetch historical data: %s", res)
+                logger.error("❌ Failed to fetch historical data (status False): %s", res)
                 return
                 
-            data = res.get("data", [])
+            data = res.get("data")
             if not data:
-                logger.warning("⚠️ No historical data returned!")
+                logger.warning("⚠️ No historical data. Res: %s | Params: %s", res, params)
                 return
                 
             ind = IndicatorEngine()
