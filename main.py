@@ -1319,7 +1319,7 @@ class TradingEngine:
         
         try:
             loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, self.angel.obj.getCandleData, params)
+            res = await loop.run_in_executor(None, self.angel._client.getCandleData, params)
             if not res or not res.get("status"):
                 logger.error("❌ Failed to fetch historical data: %s", res)
                 return
