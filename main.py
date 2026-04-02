@@ -1295,7 +1295,68 @@ class TradingEngine:
         """True when running paper mode without Angel One credentials."""
         return not bool(Cfg.API_KEY)
 
-    # ── Startup ───────────────────────────────────────────────────────────────
+    async def _preload_historical_data(self) -> None:
+        if not self.angel.auth_token:
+            return
+            
+        spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING)
+        if not spot_token:
+            return
+            
+        logger.info("⏳ Fetching historical data to warm up indicators...")
+        from datetime import timedelta
+        dt_now = datetime.now(IST)
+        # Fetch last 4 days to ensure at least 1-2 trading days cover even on Mondays
+        dt_from = dt_now - timedelta(days=4)
+        
+        params = {
+            "exchange": "NSE",
+            "symboltoken": spot_token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": dt_from.strftime("%Y-%m-%d 09:15"),
+            "todate": dt_now.strftime("%Y-%m-%d %H:%M")
+        }
+        
+        try:
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, self.angel.obj.getCandleData, params)
+            if not res or not res.get("status"):
+                logger.error("❌ Failed to fetch historical data: %s", res)
+                return
+                
+            data = res.get("data", [])
+            if not data:
+                logger.warning("⚠️ No historical data returned!")
+                return
+                
+            ind = IndicatorEngine()
+            # data item: [timestamp, open, high, low, close, volume]
+            for row in data:
+                try:
+                    c_dt = datetime.fromisoformat(row[0])
+                    ts_ms = int(c_dt.timestamp() * 1000)
+                    op, hi, lo, cl, vol = row[1], row[2], row[3], row[4], row[5]
+                    
+                    vol_q = max(0, int(vol // 4))
+                    # Forge ticks to simulate candle building
+                    for t_ms, p in [
+                        (ts_ms + 1000, op),
+                        (ts_ms + 60000, hi),
+                        (ts_ms + 120000, lo),
+                        (ts_ms + 299000, cl)
+                    ]:
+                        ind.on_tick(Tick(spot_token, p, vol_q, t_ms))
+                except Exception as inner:
+                    logger.debug("Failed to parse historical candle info: %s", inner)
+                    
+            self.indicators[spot_token] = ind
+            logger.info("✅ Historical Warmup Complete! %d candles loaded.", len(data))
+            
+            await self.tg.send(f"✅ *Indicators Warmed Up*\n"
+                               f"Loaded {len(data)} past candles.\n"
+                               f"Ready to trade immediately!")
+        except Exception as exc:
+            logger.error("❌ Exception in preload_historical_data: %s", exc)
 
     async def start(self) -> None:
         self._loop    = asyncio.get_running_loop()
@@ -1306,6 +1367,8 @@ class TradingEngine:
             ok = await self._loop.run_in_executor(None, self.angel.login)
             if not ok and Cfg.TRADE_MODE == "live":
                 raise RuntimeError("Angel One login failed")
+            if ok:
+                await self._preload_historical_data()
         else:
             logger.warning("No API_KEY — paper-only simulation mode")
 
