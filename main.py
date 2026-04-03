@@ -13,10 +13,13 @@ from __future__ import annotations
 import collections
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Deque, Dict, List, Optional, Tuple
+
+os.environ.setdefault('TZ', 'Asia/Kolkata')
 
 logger = logging.getLogger("bot")
 
@@ -959,13 +962,18 @@ class StateStore:
             try:
                 # 🛡️ Atomic Save (Prevents corruption on crash)
                 tmp_file = self._path.with_suffix(".tmp")
-                tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                tmp_file.replace(self._path)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8"))
+                await loop.run_in_executor(None, tmp_file.replace, self._path)
             except Exception as exc:
                 logger.error("State save failed: %s", exc)
 
     def day_blocked(self) -> bool:
         return self.daily_pnl <= -Cfg.MAX_DAILY_LOSS or self.daily_pnl >= Cfg.DAILY_TARGET
+
+    def _write_journal(journal_path: Path, jdata: dict) -> None:
+        with journal_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(jdata) + "\n")
 
     async def record_closed_trade(self, pnl: float) -> None:
         async with self._lock:
@@ -977,8 +985,8 @@ class StateStore:
                     jdata["exit_time"]    = datetime.now(IST).isoformat()
                     jdata["realised_pnl"] = pnl
                     jdata["trade_id"]     = self.trade_count + 1
-                    with journal_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(jdata) + "\n")
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: _write_journal(journal_path, jdata))
                 except Exception:
                     pass
             
@@ -1000,7 +1008,7 @@ class AngelClient:
         self.auth_token  = ""
         self.feed_token  = ""
         self._login_time = 0.0
-        self._session_lock = __import__("threading").Lock()  # ✅ Fix #1: Thread-safe login
+        self._session_lock = asyncio.Lock()  # ✅ Fix #1: Async-safe session lock
 
     def login(self) -> bool:
         try:
@@ -1018,17 +1026,18 @@ class AngelClient:
             logger.error("❌ Login failed: %s", exc)
             return False
 
-    def ensure_session(self) -> None:
-        # ✅ Fix #1: Only one thread can refresh the session at a time
+    async def ensure_session(self) -> None:
+        # ✅ Fix #1: Only one coroutine can refresh the session at a time
         if time.time() - self._login_time > 21600:
-            with self._session_lock:
-                # Double-check after acquiring lock (another thread may have refreshed)
+            async with self._session_lock:
+                # Double-check after acquiring lock (another coroutine may have refreshed)
                 if time.time() - self._login_time > 21600:
                     logger.info("🔄 Session expired — re-logging in...")
-                    self.login()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self.login)
 
-    def place_order(self, params: Dict[str, Any]) -> str:
-        self.ensure_session()
+    async def place_order(self, params: Dict[str, Any]) -> str:
+        await self.ensure_session()
         if not self._client:
             raise RuntimeError("Client not initialized")
         
@@ -1046,17 +1055,16 @@ class AngelClient:
                     raise RuntimeError(f"Failed after 3 retries: {exc}")
                 logger.warning("placeOrder attempt %d failed: %s. Retrying in 1s...", attempt + 1, exc)
                 time.sleep(1.0)
-        return ""
 
-    def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
-        self.ensure_session()
+    async def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
+        await self.ensure_session()
         if not self._client:
             return 0.0
         resp = self._client.ltpData(exchange, symbol, token)
         return float(resp["data"]["ltp"])
 
-    def get_funds(self) -> float:
-        self.ensure_session()
+    async def get_funds(self) -> float:
+        await self.ensure_session()
         if not self._client:
             return 0.0
         try:
@@ -1065,8 +1073,8 @@ class AngelClient:
         except Exception:
             return 0.0
 
-    def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
-        self.ensure_session()
+    async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        await self.ensure_session()
         if not self._client:
             return None
         try:
@@ -1090,12 +1098,15 @@ async def fetch_scrip_master() -> List[Dict[str, Any]]:
             r = await client.get(SCRIP_MASTER_URL)
             r.raise_for_status()
             rows = r.json()
-            cache.write_text(json.dumps(rows), encoding="utf-8")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: cache.write_text(json.dumps(rows), encoding="utf-8"))
             return rows
     except Exception as exc:
         logger.warning("Scrip master download failed (%s), trying cache", exc)
         if cache.exists():
-            return json.loads(cache.read_text(encoding="utf-8"))
+            loop = asyncio.get_running_loop()
+            text = await loop.run_in_executor(None, lambda: cache.read_text(encoding="utf-8"))
+            return json.loads(text)
         raise
 
 
@@ -1145,14 +1156,14 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
     
     loop = asyncio.get_running_loop()
     try:
-        order_id = await loop.run_in_executor(None, lambda: angel.place_order(params))
+        order_id = await angel.place_order(params)
         
         # ── Poll OrderBook to ensure fill ──
         final_filled = 0
         final_price  = 0.0
         for _ in range(Cfg.ORDER_STATUS_TIMEOUT):
             await asyncio.sleep(1.0)
-            status_data = await loop.run_in_executor(None, lambda: angel.get_order_status(order_id))
+            status_data = await angel.get_order_status(order_id)
             if status_data:
                 status = str(status_data.get("status", "")).lower()
                 final_filled = int(status_data.get("filledshares", 0) or 0)
@@ -1287,7 +1298,7 @@ class TradingEngine:
         self._sim_price  = 55000.0    # BankNifty base price
         self._sim_volume = 0
         self._sim_candle_count = 0
-        self._exit_in_progress = False
+        self._exit_lock      = asyncio.Lock()   # 🛡️ Prevents duplicate exit orders
         self._ws_connected   = False
 
     @property
@@ -1676,11 +1687,11 @@ class TradingEngine:
                 "ts_ms":  int(message.get("exchange_timestamp", time.time() * 1000) or
                               time.time() * 1000),
             }
-        if isinstance(message, (bytes, bytearray)) and len(message) >= 51:
+        if isinstance(message, (bytes, bytearray)) and len(message) >= 55:
             try:
                 token_raw = message[2:27].decode("utf-8").strip("\x00")
-                ltp_raw   = int.from_bytes(message[43:51], "big") / 100.0
-                vol       = int.from_bytes(message[59:67], "big") if len(message) >= 67 else 0
+                ltp_raw   = int.from_bytes(message[39:47], "big") / 100.0
+                vol       = int.from_bytes(message[47:55], "big")
                 return {"token": token_raw, "ltp": ltp_raw, "volume": vol,
                         "ts_ms": int(time.time() * 1000)}
             except Exception:
@@ -1777,9 +1788,7 @@ class TradingEngine:
             raw_lot_sz  = int(float(row.get("lotsize") or _lot_qty(Cfg.UNDERLYING)))
 
             if self._trade_mode_confirmed == "live" and Cfg.API_KEY:
-                opt_ltp = await self._loop.run_in_executor(  # type: ignore[union-attr]
-                    None, lambda: self.angel.get_ltp("NFO", symbol, token)
-                )
+                opt_ltp = await self.angel.get_ltp("NFO", symbol, token)
             else:
                 opt_ltp = spot_ltp * 0.01    # paper sim ~1% of index
 
@@ -1899,103 +1908,101 @@ class TradingEngine:
             await self._exit_trade(ltp, "STOP_LOSS_HIT")
 
     async def _exit_trade(self, ltp: float, reason: str = "SIGNAL_EXIT") -> None:
-        if self._exit_in_progress:
+        if self._exit_lock.locked():
+            logger.debug("Exit already in progress (%s) — skipping duplicate", reason)
             return
         if not self.state.active_trade:
             return
-        self._exit_in_progress = True
-        try:
-            trade = self.state.active_trade
-            rem_qty = trade.lot_size
-            total_sold = 0
-            weighted_prc = 0.0
+        async with self._exit_lock:
+            try:
+                trade = self.state.active_trade
+                rem_qty = trade.lot_size
+                total_sold = 0
+                weighted_prc = 0.0
 
-            for attempt in range(3):
-                try:
-                    _oid, sold_qty, avg_prc = await self.order_circuit.execute(
-                        place_limit_order, self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
-                    )
-                    if sold_qty > 0:
-                        weighted_prc += (sold_qty * avg_prc)
-                        total_sold += sold_qty
-                        rem_qty -= sold_qty
-
-                    if rem_qty <= 0:
-                        break
-                except Exception as exc:
-                    if attempt == 2 and total_sold == 0:
-                        await self.tg.alert_error("EXIT_ORDER", str(exc))
-                        return
-                    await asyncio.sleep(1.0)
-
-            if total_sold == 0:
-                return
-
-            final_exit_price = round(weighted_prc / total_sold, 2)
-
-            # === 📉 Book-keeping Block (sold qty பொறுத்து P&L) ===
-            pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
-            self.metrics.record_trade(trade.entry_time, pnl)
-
-            if rem_qty > 0:
-                # ✅ Fix #4: Partial fill — update lot_size & notify; keep active_trade alive
-                # for remaining qty to be monitored / exited later
-                trade.lot_size = rem_qty
-                if self._trailing:
-                    self._trailing.lot_size = rem_qty
-                self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
-                await self.state.save()
-                logger.warning("⚠️ Partial exit: sold=%d stranded=%d @₹%.2f",
-                                total_sold, rem_qty, final_exit_price)
-                await self.tg.send(
-                    f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
-                    f"`{trade.symbol}` Exit Avg: ₹{final_exit_price:.2f}\n"
-                    f"Sold: {total_sold} | Stranded: {rem_qty}\n"
-                    f"P&L (partial): ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
-                    f"⚠️ *{rem_qty} qty இன்னும் open* — /exitnow மீண்டும் இயக்கவும்!"
-                )
-            else:
-                # ✅ Fix #4: Complete exit — clear active_trade fully & unsubscribe WS
-                # 📡 Unsubscribe Option Token (ONLY ON COMPLETE FULL EXIT)
-                if self._ws:
+                for attempt in range(3):
                     try:
-                        self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
-                        spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
-                        sub_p = []
-                        if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
-                        self._ws.subscribe("bot_spot", 3, sub_p)
-                        logger.info("📡 Live WS Reverted to Spot only.")
-                    except Exception:
-                        pass
+                        _oid, sold_qty, avg_prc = await self.order_circuit.execute(
+                            place_limit_order, self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
+                        )
+                        if sold_qty > 0:
+                            weighted_prc += (sold_qty * avg_prc)
+                            total_sold += sold_qty
+                            rem_qty -= sold_qty
 
-                await self.state.record_closed_trade(pnl)
-                self._trailing = None
-                # Explicitly clear option LTP cache for this token
-                self._option_ltp.pop(trade.token, None)
-                self._last_pct_notify.pop(trade.token, None)
-                await self.state.save()
+                        if rem_qty <= 0:
+                            break
+                    except Exception as exc:
+                        if attempt == 2 and total_sold == 0:
+                            await self.tg.alert_error("EXIT_ORDER", str(exc))
+                            return
+                        await asyncio.sleep(1.0)
 
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                await self.tg.send(
-                    f"{emoji} *TRADE CLOSED* — {reason}\n"
-                    f"`{trade.symbol}` Exit: ₹{final_exit_price:.2f}\n"
-                    f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
-                    f"Win Rate: {self.metrics.get_win_rate():.1f}%"
-                )
-                if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
-                    self._trade_armed = False
+                if total_sold == 0:
+                    return
+
+                final_exit_price = round(weighted_prc / total_sold, 2)
+
+                # === 📉 Book-keeping Block (sold qty பொறுத்து P&L) ===
+                pnl = round((final_exit_price - trade.entry_price) * total_sold, 2)
+                self.metrics.record_trade(trade.entry_time, pnl)
+
+                if rem_qty > 0:
+                    # Partial fill — update lot_size & notify; keep active_trade alive
+                    trade.lot_size = rem_qty
+                    if self._trailing:
+                        self._trailing.lot_size = rem_qty
+                    self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
+                    await self.state.save()
+                    logger.warning("⚠️ Partial exit: sold=%d stranded=%d @₹%.2f",
+                                   total_sold, rem_qty, final_exit_price)
                     await self.tg.send(
-                        "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
-                        f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                        f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
+                        f"`{trade.symbol}` Exit Avg: ₹{final_exit_price:.2f}\n"
+                        f"Sold: {total_sold} | Stranded: {rem_qty}\n"
+                        f"P&L (partial): ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                        f"⚠️ *{rem_qty} qty இன்னும் open* — /exitnow மீண்டும் இயக்கவும்!"
                     )
-                elif self.state.daily_pnl >= Cfg.DAILY_TARGET:
-                    self._trade_armed = False
+                else:
+                    # Complete exit — clear active_trade fully & unsubscribe WS
+                    if self._ws:
+                        try:
+                            self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
+                            spot_t = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                            sub_p = []
+                            if spot_t: sub_p.append({"exchangeType": 1, "tokens": [spot_t]})
+                            self._ws.subscribe("bot_spot", 3, sub_p)
+                            logger.info("📡 Live WS Reverted to Spot only.")
+                        except Exception:
+                            pass
+
+                    await self.state.record_closed_trade(pnl)
+                    self._trailing = None
+                    self._option_ltp.pop(trade.token, None)
+                    self._last_pct_notify.pop(trade.token, None)
+                    await self.state.save()
+
+                    emoji = "🟢" if pnl >= 0 else "🔴"
                     await self.tg.send(
-                        "🎯 *DAILY TARGET HIT* — Bot disarmed. நல்ல வேலை!\n"
-                        f"Total Profit: ₹{self.state.daily_pnl:.0f}"
+                        f"{emoji} *TRADE CLOSED* — {reason}\n"
+                        f"`{trade.symbol}` Exit: ₹{final_exit_price:.2f}\n"
+                        f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                        f"Win Rate: {self.metrics.get_win_rate():.1f}%"
                     )
-        finally:
-            self._exit_in_progress = False
+                    if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
+                        self._trade_armed = False
+                        await self.tg.send(
+                            "🛑 *DAILY LOSS LIMIT HIT* — Bot disarmed for today.\n"
+                            f"Total Loss: ₹{abs(self.state.daily_pnl):.0f}"
+                        )
+                    elif self.state.daily_pnl >= Cfg.DAILY_TARGET:
+                        self._trade_armed = False
+                        await self.tg.send(
+                            "🎯 *DAILY TARGET HIT* — Bot disarmed. நல்ல வேலை!\n"
+                            f"Total Profit: ₹{self.state.daily_pnl:.0f}"
+                        )
+            except Exception as exc:
+                logger.error("_exit_trade unhandled error: %s", exc)
 
     async def _check_smart_exit(self, spot_ltp: float, ind: IndicatorEngine) -> None:
         """Hybrid Early Exit: Reversal Pattern + Price breaking EMA9."""
@@ -2049,9 +2056,7 @@ class TradingEngine:
                     ltp = 0.0
                     if Cfg.API_KEY and self._loop:
                         try:
-                            ltp = await self._loop.run_in_executor(
-                                None, lambda: self.angel.get_ltp("NFO", t.symbol, t.token)
-                            )
+                            ltp = await self.angel.get_ltp("NFO", t.symbol, t.token)
                         except Exception as ltp_err:
                             logger.warning("⚠️ EOD LTP fetch failed (%s) — using last known option LTP", ltp_err)
                     # Fallback priority: live LTP → last WS tick → entry price (last resort)
@@ -2403,6 +2408,8 @@ def build_app(engine: TradingEngine) -> Optional[Application]:
             "TELEGRAM_TOKEN, TELEGRAM_BOT_TOKEN, BOT_TOKEN, TG_TOKEN"
         )
         return None
+    if len(token) < 10 or ":" not in token:
+        raise ValueError("Invalid Telegram token format")
 
     logger.info("✅ Telegram token found (len=%d) — building app...", len(token))
     app = Application.builder().token(token).build()
