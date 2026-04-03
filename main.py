@@ -1602,9 +1602,7 @@ class TradingEngine:
         def on_open(wsapp):
             self._ws_connected = True
             logger.info("WebSocket connected ✅ — subscribing to %s", spot_token)
-            # BUG FIX: subscribe() is a method of SmartWebSocketV2, NOT wsapp.
-            # wsapp is the underlying websocket-client WebSocketApp object.
-            if sub_payload and self._ws and hasattr(self._ws, "socket") and self._ws.socket:
+            if sub_payload and self._ws:
                 try:
                     self._ws.subscribe("bot1", 3, sub_payload)
                     logger.info("📡 Subscribed to BankNifty feed (token=%s)", spot_token)
@@ -2424,6 +2422,21 @@ def build_app(engine: TradingEngine) -> Optional[Application]:
 
 
 async def _async_main() -> None:
+    # === EMERGENCY DEBUG BLOCK ===
+    import sys
+    import os
+    logger.info("=" * 70)
+    logger.info("🚨 EMERGENCY DEBUG: Bot starting at %s", datetime.now(IST))
+    logger.info(f"🚨 Python: {sys.version}")
+    logger.info(f"🚨 Platform: {sys.platform}")
+    logger.info(f"🚨 CWD: {os.getcwd()}")
+    logger.info(f"🚨 Files: {os.listdir('.')[:10]}")
+    logger.info(f"🚨 Env keys: {[k for k in os.environ.keys() if not k.startswith('_')]}")
+    logger.info(f"🚨 TELEGRAM_TOKEN exists: {bool(Cfg.TELEGRAM_TOKEN)}")
+    logger.info(f"🚨 TELEGRAM_CHAT_ID: {Cfg.TELEGRAM_CHAT_ID}")
+    logger.info("=" * 70)
+    # === END DEBUG ===
+
     # ── 1. Print startup env info ─────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("ULTRA-FAST ALGO BOT STARTING")
