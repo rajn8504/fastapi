@@ -540,7 +540,7 @@ class AlphaStrategy:
     RSI_CALL_MIN        = 55.0   # relaxed from 60
     RSI_PUT_MAX         = 45.0   # relaxed from 40
     ADX_MIN             = 20.0   # skip sideways markets
-        PRIME_WINDOWS       = [(915, 1130), (1230, 1430)]  # IST HHMM
+    PRIME_WINDOWS       = [(915, 1130), (1230, 1430)]  # IST HHMM
     CALL_BLOCK_PATTERNS = {"BEARISH_ENGULFING", "SHOOTING_STAR", "DOJI"}
     PUT_BLOCK_PATTERNS  = {"BULLISH_ENGULFING", "HAMMER", "DOJI"}
     CALL_BOOST_PATTERNS = {"BULLISH_ENGULFING", "HAMMER"}
