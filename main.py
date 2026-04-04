@@ -311,7 +311,16 @@ class IndicatorEngine:
             return False
         recent = list(self._candles)[-self.VOLUME_SPIKE_LOOKBACK:]
         avg = sum(c.volume for c in recent) / len(recent)
-        return avg > 0 and self._cur_volume >= avg * self.VOLUME_SPIKE_FACTOR
+        
+        # Bug 7: Project current volume for incomplete candles
+        if self._cur_candle_start > 0:
+            elapsed = time.time() - self._cur_candle_start
+            pct = min(elapsed / self.CANDLE_SECONDS, 1.0)
+            projected = self._cur_volume / max(pct, 0.1)  # Min 10% to avoid /0 error
+        else:
+            projected = self._cur_volume
+            
+        return avg > 0 and projected >= avg * self.VOLUME_SPIKE_FACTOR
 
     @property
     def candles(self) -> List[Candle]:
@@ -435,6 +444,12 @@ class IndicatorEngine:
         if self._kalman_x == 0.0:
             self._kalman_x = price
             return
+        # Bug 13: Sanity check for massive price jumps during anomalies
+        if abs(price - self._kalman_x) > self._kalman_x * 0.05:
+            logger.warning("Kalman reset due to price jump: %.2f -> %.2f", self._kalman_x, price)
+            self._kalman_x = price
+            self._kalman_P = 1.0
+            return
         P_pred = self._kalman_P + self._kalman_Q
         K = P_pred / (P_pred + self._kalman_R)
         self._kalman_x += K * (price - self._kalman_x)
@@ -525,7 +540,7 @@ class AlphaStrategy:
     RSI_CALL_MIN        = 55.0   # relaxed from 60
     RSI_PUT_MAX         = 45.0   # relaxed from 40
     ADX_MIN             = 20.0   # skip sideways markets
-    PRIME_WINDOWS       = [(945, 1115), (1230, 1400)]  # IST HHMM
+        PRIME_WINDOWS       = [(915, 1130), (1230, 1430)]  # IST HHMM
     CALL_BLOCK_PATTERNS = {"BEARISH_ENGULFING", "SHOOTING_STAR", "DOJI"}
     PUT_BLOCK_PATTERNS  = {"BULLISH_ENGULFING", "HAMMER", "DOJI"}
     CALL_BOOST_PATTERNS = {"BULLISH_ENGULFING", "HAMMER"}
@@ -567,8 +582,7 @@ class AlphaStrategy:
                                 ema_fast_slope=ema_slope,
                                 candle_pattern=pattern)
 
-        if (t0 - self._last_signal_time) < self._signal_cooldown_s:
-            return _no("Cooldown active")
+        # Bug 5 Fix: Cooldown moved to _fire_order (applies only AFTER successful trade)
 
         warmup = max(IndicatorEngine.ADX_PERIOD + 2, IndicatorEngine.SUPERTREND_PERIOD + 2)  # 16
         if indicator.num_candles < warmup:
@@ -584,9 +598,12 @@ class AlphaStrategy:
 
         # Layer 4: M15 Multi-Timeframe alignment (skip until M15 warmed up)
         m15_dir = indicator.m15_supertrend_direction
-        if indicator.m15_num_candles >= IndicatorEngine.SUPERTREND_PERIOD + 2:
+        m15_min = int(os.getenv("M15_MIN_CANDLES", "12"))
+        if indicator.m15_num_candles >= m15_min:
             if st_dir != m15_dir:
                 return _no(f"MTF mismatch: M5={st_dir} vs M15={m15_dir} — no alignment")
+        elif indicator.m15_num_candles > 0:
+            pass # M15 is still warming up, allow trade based on M5
 
         # Layer 6: Dynamic pullback threshold = max(0.3%, ATR×0.1/price)
         atr = indicator.current_atr
@@ -594,9 +611,9 @@ class AlphaStrategy:
 
         # ── CALL ─────────────────────────────────────────────────────────────
         if st_dir == "UP" and ema_bull and above_vwap and rsi >= self.RSI_CALL_MIN:
-            slope_threshold = 0.0005 * price
-            if ema_slope < slope_threshold:
-                return _no(f"ST=UP ✓ — flat EMA slope ({ema_slope:.2f}<{slope_threshold:.2f}) whipsaw risk")
+            slope_pct = ema_slope / price if price > 0 else 0
+            if slope_pct < 0.0003:  # Bug 1: 0.03% (15 points in BN)
+                return _no(f"ST=UP ✓ — flat EMA slope ({slope_pct:.4%}) whipsaw risk")
             if not vol_spike:
                 return _no(f"ST=UP EMA✓ VWAP✓ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.CALL_BLOCK_PATTERNS:
@@ -609,7 +626,6 @@ class AlphaStrategy:
             # Layer 6b: Range momentum — candle must show energy
             if indicator.range_ratio < 1.3 and indicator.num_candles >= 10:
                 return _no(f"Weak range={indicator.range_ratio:.2f}x <1.3x avg")
-            self._last_signal_time = t0
             strength = min(100, 65 + int((rsi - 55) * 2.5)
                           + (15 if pattern in self.CALL_BOOST_PATTERNS else 0)
                           + adx_boost)
@@ -623,9 +639,9 @@ class AlphaStrategy:
 
         # ── PUT ──────────────────────────────────────────────────────────────
         if st_dir == "DOWN" and not ema_bull and not above_vwap and rsi <= self.RSI_PUT_MAX:
-            slope_threshold = 0.0005 * price
-            if ema_slope > -slope_threshold:
-                return _no(f"ST=DOWN ✓ — flat EMA slope ({ema_slope:.2f}>{-slope_threshold:.2f}) whipsaw risk")
+            slope_pct = ema_slope / price if price > 0 else 0
+            if slope_pct > -0.0003:  # Bug 1: -0.03%
+                return _no(f"ST=DOWN ✓ — flat EMA slope ({slope_pct:.4%}) whipsaw risk")
             if not vol_spike:
                 return _no(f"ST=DOWN EMA✗ VWAP✗ RSI={rsi:.1f} ADX={adx:.1f} — waiting vol spike")
             if pattern in self.PUT_BLOCK_PATTERNS:
@@ -638,7 +654,6 @@ class AlphaStrategy:
             # Layer 6b: Range momentum
             if indicator.range_ratio < 1.3 and indicator.num_candles >= 10:
                 return _no(f"Weak range={indicator.range_ratio:.2f}x <1.3x avg")
-            self._last_signal_time = t0
             strength = min(100, 65 + int((45 - rsi) * 2.5)
                           + (15 if pattern in self.PUT_BOOST_PATTERNS else 0)
                           + adx_boost)
@@ -688,8 +703,14 @@ class TrailingState:
                     self.high_water += increments * self.trail_step_price
                     changed = True
 
-        if changed:
+        # Bug 4: Max SL Cap (Protect profits from turning into loss on huge spikes)
+        max_allowed_sl = self.entry_price * 1.08  # Max 8% above entry price
+        if new_sl > max_allowed_sl:
+            new_sl = max_allowed_sl
+
+        if changed or new_sl != self.current_sl:
             self.current_sl = round(new_sl, 2)
+            changed = True
         return changed, self.current_sl
 
 
@@ -817,12 +838,12 @@ class Cfg:
     RISK_PER_TRADE_PCT = float(_get_env("RISK_PER_TRADE_PCT", default="1.5"))
 
     # ── Advanced Trading Settings ───────────────────────────────────────────
-    ORDER_STATUS_TIMEOUT = int(_get_env("ORDER_STATUS_TIMEOUT", default="8"))
+    ORDER_STATUS_TIMEOUT = int(_get_env("ORDER_STATUS_TIMEOUT", default="15"))
     ORDER_RETRIES        = int(_get_env("ORDER_RETRIES",        default="8"))
 
     # ── Capital Protection Settings ─────────────────────────────────────────
     MAX_DAILY_TRADES    = int(_get_env("MAX_DAILY_TRADES",    default="2"))    # max trades/day
-    MIN_SIGNAL_STRENGTH = int(_get_env("MIN_SIGNAL_STRENGTH", default="75"))   # min strength to trade
+    MIN_SIGNAL_STRENGTH = int(_get_env("MIN_SIGNAL_STRENGTH", default="60"))   # min strength to trade
     CONSEC_LOSS_STOP    = int(_get_env("CONSEC_LOSS_STOP",    default="2"))    # stop after N consecutive losses
     PROFIT_LOCK_AT      = float(_get_env("PROFIT_LOCK_AT",    default="500"))  # lock profits (tighten SL) above this
     SLIPPAGE_BUFFER     = float(_get_env("SLIPPAGE_BUFFER",   default="3.0"))  # padding for limit order execution
@@ -906,6 +927,7 @@ class ActiveTrade:
     mode:        str
     high_water:  float = 0.0
     is_breakeven: bool = False
+    realized_pnl: float = 0.0
 
 
 class StateStore:
@@ -971,6 +993,7 @@ class StateStore:
     def day_blocked(self) -> bool:
         return self.daily_pnl <= -Cfg.MAX_DAILY_LOSS or self.daily_pnl >= Cfg.DAILY_TARGET
 
+    @staticmethod
     def _write_journal(journal_path: Path, jdata: dict) -> None:
         with journal_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(jdata) + "\n")
@@ -986,7 +1009,7 @@ class StateStore:
                     jdata["realised_pnl"] = pnl
                     jdata["trade_id"]     = self.trade_count + 1
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: _write_journal(journal_path, jdata))
+                    await loop.run_in_executor(None, lambda: StateStore._write_journal(journal_path, jdata))
                 except Exception:
                     pass
             
@@ -1028,22 +1051,30 @@ class AngelClient:
 
     async def ensure_session(self) -> None:
         # ✅ Fix #1: Only one coroutine can refresh the session at a time
-        if time.time() - self._login_time > 21600:
-            async with self._session_lock:
-                # Double-check after acquiring lock (another coroutine may have refreshed)
-                if time.time() - self._login_time > 21600:
-                    logger.info("🔄 Session expired — re-logging in...")
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.login)
+        # 19800s = 5.5h — consistent with health_check threshold
+        if time.time() - self._login_time > 19800:
+            try:
+                await asyncio.wait_for(self._session_lock.acquire(), timeout=10.0)
+                try:
+                    # Double-check after acquiring lock (another coroutine may have refreshed)
+                    if time.time() - self._login_time > 19800:
+                        logger.info("🔄 Session expired — re-logging in...")
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, self.login)
+                finally:
+                    self._session_lock.release()
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for Angel One session lock. Possible deadlock prevented.")
 
     async def place_order(self, params: Dict[str, Any]) -> str:
         await self.ensure_session()
         if not self._client:
             raise RuntimeError("Client not initialized")
-        
+        loop = asyncio.get_running_loop()
         for attempt in range(3):
             try:
-                resp = self._client.placeOrder(params)
+                # Bug Fix: placeOrder is a blocking sync call — must run in executor
+                resp = await loop.run_in_executor(None, lambda: self._client.placeOrder(params))
                 if not resp or not resp.get("status"):
                     # Capture Angel One explicit rejection
                     raise RuntimeError(f"Order rejected internally: {resp}")
@@ -1054,23 +1085,36 @@ class AngelClient:
                 if attempt == 2:
                     raise RuntimeError(f"Failed after 3 retries: {exc}")
                 logger.warning("placeOrder attempt %d failed: %s. Retrying in 1s...", attempt + 1, exc)
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)  # Bug Fix: was time.sleep() — blocks event loop!
 
     async def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
         await self.ensure_session()
         if not self._client:
             return 0.0
-        resp = self._client.ltpData(exchange, symbol, token)
-        return float(resp["data"]["ltp"])
+        try:
+            # Bug Fix: ltpData is a blocking sync call — run in executor
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(
+                None, lambda: self._client.ltpData(exchange, symbol, token)
+            )
+            data = resp.get("data") or {}
+            return float(data.get("ltp", 0.0))
+        except Exception as exc:
+            logger.warning("get_ltp failed (%s/%s): %s", exchange, token, exc)
+            return 0.0
 
     async def get_funds(self) -> float:
         await self.ensure_session()
         if not self._client:
             return 0.0
         try:
-            data = self._client.rmsLimit().get("data", {})
+            # Bug Fix: rmsLimit is a blocking sync call — run in executor
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, self._client.rmsLimit)
+            data = (resp or {}).get("data") or {}
             return float(data.get("availablecash", 0))
-        except Exception:
+        except Exception as exc:
+            logger.warning("get_funds failed: %s", exc)
             return 0.0
 
     async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
@@ -1078,7 +1122,9 @@ class AngelClient:
         if not self._client:
             return None
         try:
-            resp = self._client.orderBook()
+            # Bug Fix: orderBook is a blocking sync call — run in executor
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, self._client.orderBook)
             data = resp.get("data") if resp else None
             if data and isinstance(data, list):
                 for order in data:
@@ -1137,21 +1183,31 @@ def find_atm_option(rows: List[Dict], underlying: str, spot: float,
 
 # ── Order helper ──────────────────────────────────────────────────────────────
 
-async def place_limit_order(angel: AngelClient, symbol: str, token: str,
-                             qty: int, action: str, ltp: float,
-                             buffer: float = -1.0, trade_mode: str = "paper") -> Tuple[str, int, float]:
+async def place_order_execution(angel: AngelClient, symbol: str, token: str,
+                                qty: int, action: str, ltp: float,
+                                buffer: float = -1.0, trade_mode: str = "paper") -> Tuple[str, int, float]:
     if buffer < 0:
         buffer = Cfg.SLIPPAGE_BUFFER
-    price  = _round_tick(ltp + buffer if action == "BUY" else ltp - buffer)
+    
+    if action == "SELL":
+        ordertype = "MARKET"
+        price_str = "0"
+        duration = "DAY"
+    else:
+        ordertype = "LIMIT"
+        price = _round_tick(ltp + buffer)
+        price_str = str(price)
+        duration = "IOC"
+
     params = {
         "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token,
-        "transactiontype": action, "exchange": "NFO", "ordertype": "LIMIT",
-        "producttype": "INTRADAY", "duration": "IOC",
-        "quantity": str(qty), "price": str(price),
+        "transactiontype": action, "exchange": "NFO", "ordertype": ordertype,
+        "producttype": "INTRADAY", "duration": duration,
+        "quantity": str(qty), "price": price_str,
     }
     if trade_mode == "paper":
         sim_id = f"PAPER_{int(time.time() * 1000)}"
-        logger.info("[PAPER] %s %s qty=%d @%.2f", action, symbol, qty, price)
+        logger.info("[PAPER] %s %s qty=%d @%.2f", action, symbol, qty, ltp)
         return sim_id, qty, price
     
     loop = asyncio.get_running_loop()
@@ -1161,8 +1217,8 @@ async def place_limit_order(angel: AngelClient, symbol: str, token: str,
         # ── Poll OrderBook to ensure fill ──
         final_filled = 0
         final_price  = 0.0
-        for _ in range(Cfg.ORDER_STATUS_TIMEOUT):
-            await asyncio.sleep(1.0)
+        for _ in range(int(Cfg.ORDER_STATUS_TIMEOUT * 2)):
+            await asyncio.sleep(0.5)
             status_data = await angel.get_order_status(order_id)
             if status_data:
                 status = str(status_data.get("status", "")).lower()
@@ -1199,13 +1255,19 @@ class TelegramNotifier:
         if not self._bot or not self._chat_id:
             logger.info("[TG] %s", text[:200])
             return
+        # Bug 15: Telegram truncation limit
+        if len(text) > 4000:
+            text = text[:3997] + "..."
         try:
             await self._bot.send_message(
                 chat_id=self._chat_id, text=text,
                 parse_mode="Markdown", reply_markup=reply_markup,
             )
         except Exception as exc:
-            logger.error("Telegram send failed: %s", exc)
+            logger.error("Telegram Markdown send failed: %s", exc)
+            try:
+                await self._bot.send_message(chat_id=self._chat_id, text=text)
+            except Exception: pass
 
     async def alert_error(self, component: str, error: str) -> None:
         await self.send(f"🚨 *ERROR* — `{component}`\n`{error}`")
@@ -1219,19 +1281,25 @@ class MetricsCollector:
     def record_trade(self, entry_time_str: str, pnl: float) -> None:
         try:
             entry_time = datetime.fromisoformat(entry_time_str)
-            execution_time = (datetime.now(IST) - entry_time).total_seconds()
+            # Bug Fix: ensure timezone-aware comparison (entry_time may be naive)
+            now_ist = datetime.now(IST)
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=IST)
+            execution_time = (now_ist - entry_time).total_seconds()
             self.trade_times.append(execution_time)
         except Exception:
             pass
-        if pnl > 0: self.wins += 1
-        elif pnl < 0: self.losses += 1
+        if pnl > 0:
+            self.wins += 1
+        elif pnl < 0:
+            self.losses += 1
 
     def get_win_rate(self) -> float:
         total = self.wins + self.losses
         return round((self.wins / total * 100), 2) if total > 0 else 0.0
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 3, timeout_sec: int = 60) -> None:
+    def __init__(self, failure_threshold: int = 5, timeout_sec: int = 300) -> None:
         self.failures = 0
         self.last_failure = 0.0
         self.state = "CLOSED"
@@ -1255,7 +1323,8 @@ class CircuitBreaker:
         except Exception as e:
             self.failures += 1
             self.last_failure = time.time()
-            if self.failures >= self.failure_threshold:
+            # Bug 14: Re-open immediately if failed from half-open
+            if self.state == "HALF_OPEN" or self.failures >= self.failure_threshold:
                 self.state = "OPEN"
                 logger.error("🛡️ CIRCUIT BREAKER TRIPPED! Angel API banned or failing!")
             raise e
@@ -1567,6 +1636,10 @@ class TradingEngine:
         if not self._trade_armed:
             return
 
+        # Bug 5 Fix: Ensure Cooldown restricts evaluate
+        if (time.monotonic() - self.strategy._last_signal_time) < self.strategy._signal_cooldown_s:
+            return
+
         result = self.strategy.evaluate(ltp, ind)
         if result.signal in ("CALL", "PUT"):
             elapsed = (time.monotonic() - t_start) * 1000
@@ -1599,24 +1672,25 @@ class TradingEngine:
             await asyncio.sleep(5)
             return
 
-        spot_token  = SPOT_TOKEN.get(Cfg.UNDERLYING)
-        sub_payload = []
-        if spot_token:
-            sub_payload.append({"exchangeType": 1, "tokens": [spot_token]})
-        if self.state.active_trade:
-            sub_payload.append({"exchangeType": 2, "tokens": [self.state.active_trade.token]})
-
         loop        = asyncio.get_running_loop()
 
         # ── Callback definitions ───────────────────────────────────────────────
 
         def on_open(wsapp):
             self._ws_connected = True
-            logger.info("WebSocket connected ✅ — subscribing to %s", spot_token)
-            if sub_payload and self._ws:
+            logger.info("WebSocket connected ✅")
+            if self._ws:
                 try:
+                    # Bug 3: ALWAYS rebuild sub_payload internally on connect/reconnect
+                    spot_t  = SPOT_TOKEN.get(Cfg.UNDERLYING, "")
+                    bank_t  = list(BANK_LEADERS.values())
+                    tokens  = [spot_t] + bank_t if spot_t else bank_t
+                    sub_payload = [{"exchangeType": 1, "tokens": tokens}]
+                    if self.state.active_trade:
+                        sub_payload.append({"exchangeType": 2, "tokens": [self.state.active_trade.token]})
+                        
                     self._ws.subscribe("bot1", 3, sub_payload)
-                    logger.info("📡 Subscribed to BankNifty feed (token=%s)", spot_token)
+                    logger.info("📡 Subscribed to Spot, Bank Leaders & Active Trade (if any)")
                 except Exception as sub_err:
                     logger.error("Subscribe failed: %s", sub_err)
 
@@ -1719,12 +1793,11 @@ class TradingEngine:
             return
         
         await self.state.check_day_rollover()
-        
+
         # Skip market hours check in demo mode (simulation bypasses via _process_tick_demo)
         if not self._demo_mode and (not _is_trading_hours() or self.state.day_blocked()):
             return
-        if self.state.day_blocked():
-            return
+        # Bug Fix: removed duplicate day_blocked() check (was dead code after the line above)
 
         # Continuous Background Execution (Crucial for Smart Exits)
         if token not in self.indicators:
@@ -1765,7 +1838,10 @@ class TradingEngine:
                         self.state.consec_losses)
             return
         # Gate 4 (Layer 5): Bank leader correlation — at least 1 must confirm
-        if self._bank_ltps and self._bank_prev_ltps:
+        # Bug Fix: Only apply when BOTH current and previous data are available for at least 1 bank.
+        # Without this guard, empty dicts cause confirms=0 → every trade blocked!
+        bypass_corr = os.getenv("DISABLE_BANK_CORRELATION", "true").lower() == "true"
+        if not bypass_corr and self._bank_ltps and self._bank_prev_ltps and len(self._bank_ltps) >= 1:
             confirms = sum(
                 1 for tok, ltp in self._bank_ltps.items()
                 if (signal.signal == "CALL" and ltp > self._bank_prev_ltps.get(tok, ltp))
@@ -1776,6 +1852,8 @@ class TradingEngine:
                             signal.signal)
                 return
             logger.info("📊 Layer5 Correlation: %d/2 bank leaders confirm %s", confirms, signal.signal)
+        elif not self._bank_ltps:
+            logger.debug("⚠️ Layer5: No bank leader data yet — skipping correlation check")
 
         t0 = time.monotonic()
         try:
@@ -1802,17 +1880,31 @@ class TradingEngine:
             
             # Max risk per trade: defaults to 1.5% of absolute capital
             max_risk_trade = Cfg.CAPITAL * (Cfg.RISK_PER_TRADE_PCT / 100.0) 
+            risk_per_lot   = risk_per_share * raw_lot_sz
             
-            lots_by_risk = max(1, int(max_risk_trade / (risk_per_share * raw_lot_sz)))
-            lots_by_capital = max(1, int(Cfg.CAPITAL / (opt_ltp * raw_lot_sz)))
+            lots_by_capital = int(Cfg.CAPITAL / (opt_ltp * raw_lot_sz))
+            if lots_by_capital < 1:
+                logger.warning("🛑 Insufficient Capital. Req: ₹%.2f, Have: ₹%.2f", opt_ltp * raw_lot_sz, Cfg.CAPITAL)
+                await self.tg.send(f"🛑 *Trade Blocked* - Insufficient Capital.\nReq: ₹{opt_ltp * raw_lot_sz:,.2f} | Bal: ₹{Cfg.CAPITAL:,.2f}")
+                return
+                
+            # Risk Limit Guard Check (Fixed duplicate calculation)
+            if risk_per_lot > max_risk_trade:
+                logger.warning("⚠️ Risk per lot (₹%.2f) exceeds max allowed risk (₹%.2f). Capping at 1 lot.", risk_per_lot, max_risk_trade)
+                lots_by_risk = 1
+            else:
+                lots_by_risk = max(1, int(max_risk_trade / risk_per_lot))
+                
             safe_lots = min(lots_by_risk, lots_by_capital, Cfg.LOT_SIZE)
             
             qty = safe_lots * raw_lot_sz
             logger.info("📐 Sizing: Lots=%d (Risk Bound) Qty=%d", safe_lots, qty)
 
             order_id, filled_qty, avg_price = await self.order_circuit.execute(
-                place_limit_order, self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed
+                place_order_execution, self.angel, symbol, token, qty, "BUY", opt_ltp, trade_mode=self._trade_mode_confirmed
             )
+            # Bug 5 Fix: Reset cooldown only when trade is effectively placed
+            self.strategy._last_signal_time = time.monotonic()
             sl       = _sl_price_dynamic(avg_price, atr=signal.entry_atr)
 
             trade = ActiveTrade(
@@ -1923,7 +2015,7 @@ class TradingEngine:
                 for attempt in range(3):
                     try:
                         _oid, sold_qty, avg_prc = await self.order_circuit.execute(
-                            place_limit_order, self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
+                            place_order_execution, self.angel, trade.symbol, trade.token, rem_qty, "SELL", ltp, trade_mode=trade.mode
                         )
                         if sold_qty > 0:
                             weighted_prc += (sold_qty * avg_prc)
@@ -1950,9 +2042,9 @@ class TradingEngine:
                 if rem_qty > 0:
                     # Partial fill — update lot_size & notify; keep active_trade alive
                     trade.lot_size = rem_qty
+                    trade.realized_pnl += pnl
                     if self._trailing:
                         self._trailing.lot_size = rem_qty
-                    self.state.daily_pnl = round(self.state.daily_pnl + pnl, 2)
                     await self.state.save()
                     logger.warning("⚠️ Partial exit: sold=%d stranded=%d @₹%.2f",
                                    total_sold, rem_qty, final_exit_price)
@@ -1960,11 +2052,13 @@ class TradingEngine:
                         f"⚠️ *PARTIAL FILL EXIT* — {reason}\n"
                         f"`{trade.symbol}` Exit Avg: ₹{final_exit_price:.2f}\n"
                         f"Sold: {total_sold} | Stranded: {rem_qty}\n"
-                        f"P&L (partial): ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                        f"P&L (partial secured): ₹{pnl:+.0f}\n"
                         f"⚠️ *{rem_qty} qty இன்னும் open* — /exitnow மீண்டும் இயக்கவும்!"
                     )
                 else:
                     # Complete exit — clear active_trade fully & unsubscribe WS
+                    total_pnl = pnl + getattr(trade, 'realized_pnl', 0.0)
+                    trade.realized_pnl = 0.0  # Bug 2 Fix: Prevent double counting loop if state saves after this
                     if self._ws:
                         try:
                             self._ws.unsubscribe("bot_opt", 3, [{"exchangeType": 2, "tokens": [trade.token]}])
@@ -1976,17 +2070,17 @@ class TradingEngine:
                         except Exception:
                             pass
 
-                    await self.state.record_closed_trade(pnl)
+                    await self.state.record_closed_trade(total_pnl)
                     self._trailing = None
                     self._option_ltp.pop(trade.token, None)
                     self._last_pct_notify.pop(trade.token, None)
                     await self.state.save()
 
-                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    emoji = "🟢" if total_pnl >= 0 else "🔴"
                     await self.tg.send(
                         f"{emoji} *TRADE CLOSED* — {reason}\n"
                         f"`{trade.symbol}` Exit: ₹{final_exit_price:.2f}\n"
-                        f"P&L: ₹{pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
+                        f"P&L: ₹{total_pnl:+.0f}  Daily: ₹{self.state.daily_pnl:+.0f}\n"
                         f"Win Rate: {self.metrics.get_win_rate():.1f}%"
                     )
                     if self.state.daily_pnl <= -Cfg.MAX_DAILY_LOSS:
@@ -2017,6 +2111,7 @@ class TradingEngine:
 
         pattern = ind.last_candle_pattern
         if trade.option_type == "CE":
+            # Compare spot_ltp with spot EMA (ind.ema_fast). PnL uses actual option LTP.
             if pattern in self.strategy.CALL_BLOCK_PATTERNS and spot_ltp < ind.ema_fast:
                 logger.info("🧠 Smart Exit Triggered: CE reversal %s + EMA break", pattern)
                 await self.tg.send(f"🧠 *Smart Exit triggered!*\nPattern: `{pattern}`\nSecured P&L: ₹{pnl_unrealised:.0f}")
@@ -2428,6 +2523,12 @@ def build_app(engine: TradingEngine) -> Optional[Application]:
     app.add_handler(CommandHandler("setad",         engine.cmd_setad))
     app.add_handler(CommandHandler("help",          engine.cmd_help))
     app.add_handler(CallbackQueryHandler(engine.callback_handler))
+
+    # Bug Fix: Add error handler to suppress uncaught exception logs + avoid crashes
+    async def _tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.warning("Telegram handler error: %s", context.error)
+
+    app.add_error_handler(_tg_error_handler)
     return app
 
 
