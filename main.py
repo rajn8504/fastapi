@@ -1033,21 +1033,30 @@ class AngelClient:
         self._login_time = 0.0
         self._session_lock = asyncio.Lock()  # ✅ Fix #1: Async-safe session lock
 
-    def login(self) -> bool:
-        try:
-            totp           = pyotp.TOTP(Cfg.TOTP_SECRET).now()
-            self._client   = SmartConnect(api_key=Cfg.API_KEY)
-            session        = self._client.generateSession(Cfg.CLIENT_ID, Cfg.PASSWORD, totp)
-            if not (session and session.get("status")):
-                raise RuntimeError(f"Session failed: {session}")
-            self.auth_token  = session["data"]["jwtToken"]
-            self.feed_token  = self._client.getfeedToken()
-            self._login_time = time.time()
-            logger.info("✅ Angel One login successful")
-            return True
-        except Exception as exc:
-            logger.error("❌ Login failed: %s", exc)
-            return False
+    def login(self, max_retries: int = 3) -> bool:
+        for attempt in range(1, max_retries + 1):
+            try:
+                totp           = pyotp.TOTP(Cfg.TOTP_SECRET).now()
+                self._client   = SmartConnect(api_key=Cfg.API_KEY)
+                session        = self._client.generateSession(Cfg.CLIENT_ID, Cfg.PASSWORD, totp)
+                if not (session and session.get("status")):
+                    if attempt < max_retries:
+                        logger.warning("⚠️ Login attempt %d failed: %s. Retrying in 10s...", attempt, session.get('message', session))
+                        time.sleep(10)  # Safe here because it's run inside a ThreadPoolExecutor
+                        continue
+                    raise RuntimeError(f"Session failed: {session}")
+                self.auth_token  = session["data"]["jwtToken"]
+                self.feed_token  = self._client.getfeedToken()
+                self._login_time = time.time()
+                logger.info("✅ Angel One login successful on attempt %d", attempt)
+                return True
+            except Exception as exc:
+                if attempt < max_retries:
+                    logger.warning("⚠️ Login attempt %d failed: %s. Retrying in 10s...", attempt, exc)
+                    time.sleep(10)
+                else:
+                    logger.error("❌ Login failed after %d attempts: %s", max_retries, exc)
+        return False
 
     async def ensure_session(self) -> None:
         # ✅ Fix #1: Only one coroutine can refresh the session at a time
