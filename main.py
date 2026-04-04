@@ -2236,8 +2236,11 @@ class TradingEngine:
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         bal = 0.0
-        if Cfg.API_KEY and self._loop:
-            bal = await self._loop.run_in_executor(None, self.angel.get_funds)
+        if Cfg.API_KEY:
+            try:
+                bal = await self.angel.get_funds()
+            except Exception as _fe:
+                logger.warning("Balance fetch failed: %s", _fe)
         mhi = market_health_index(self._vix, self._ad_ratio)
         t = self.state.active_trade
         trade_info = "None"
@@ -2253,7 +2256,7 @@ class TradingEngine:
             f"Balance: ₹{bal:,.0f}\n"
             f"Today P&L: ₹{self.state.daily_pnl:+.0f}\n"
             f"Trades today: {self.state.trade_count}\n"
-            f"Win Rate: {self.metrics.get_win_rate()}%\n"
+            f"Win Rate: {self.metrics.get_win_rate():.1f}%\n"
             f"Active Trade: {trade_info}\n"
             f"Armed: {'✅' if self._trade_armed else '❌'} ({mode_str})\n"
             f"Market Health: {mhi['label']} (score={mhi['score']})\n"
