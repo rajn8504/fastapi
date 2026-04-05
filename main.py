@@ -853,7 +853,9 @@ class Cfg:
 
     UNDERLYING  = _get_env("UNDERLYING",  default="BANKNIFTY")
     TRADE_MODE  = _get_env("TRADE_MODE",  default="paper").lower()
-    STATE_FILE  = Path(_get_env("STATE_FILE", default="db.json"))
+    
+    DATA_DIR    = _get_env("DATA_DIR",    default="")
+    STATE_FILE  = Path(DATA_DIR) / _get_env("STATE_FILE", default="db.json") if DATA_DIR else Path(_get_env("STATE_FILE", default="db.json"))
 
     TRADE_START = int(_get_env("TRADE_START", default="930"))
     TRADE_END   = int(_get_env("TRADE_END",   default="1430"))
@@ -1230,8 +1232,11 @@ async def place_order_execution(angel: AngelClient, symbol: str, token: str,
         # ── Poll OrderBook to ensure fill ──
         final_filled = 0
         final_price  = 0.0
-        for _ in range(int(Cfg.ORDER_STATUS_TIMEOUT * 2)):
-            await asyncio.sleep(0.5)
+        poll_interval = 1.0
+        start_time = time.time()
+        
+        while time.time() - start_time < Cfg.ORDER_STATUS_TIMEOUT:
+            await asyncio.sleep(poll_interval)
             status_data = await angel.get_order_status(order_id)
             if status_data:
                 status = str(status_data.get("status", "")).lower()
@@ -1245,6 +1250,9 @@ async def place_order_execution(angel: AngelClient, symbol: str, token: str,
                 if "completed" in status or final_filled >= qty:
                     if final_price > 0.0:
                         break
+                        
+            # Exponential backoff (1s, 1.5s, 2.25s...) to protect Rate Limits
+            poll_interval = min(3.0, poll_interval * 1.5)
         
         if final_filled > 0 and final_price <= 0.0:
             final_price = ltp
