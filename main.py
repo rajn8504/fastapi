@@ -6,6 +6,8 @@ Hybrid Supertrend(3,10) + VWAP + RSI(9) + Volume Spike Strategy
 
 from __future__ import annotations
 
+VERSION = "v2.1.0"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STRATEGIES MODULE (inlined — no external import needed)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -939,6 +941,7 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self.daily_pnl       = 0.0
         self.trade_count     = 0
         self.consec_losses   = 0   # consecutive losing trades today
@@ -1405,6 +1408,9 @@ class TradingEngine:
         if not self.angel.auth_token:
             return
             
+        # ⏱️ WAIT for session stabilization
+        await asyncio.sleep(2.0)
+            
         spot_token = SPOT_TOKEN.get(Cfg.UNDERLYING)
         if not spot_token:
             return
@@ -1473,7 +1479,7 @@ class TradingEngine:
     async def start(self) -> None:
         self._loop    = asyncio.get_running_loop()
         self._running = True
-        logger.info("🚀 Starting — mode=%s underlying=%s", Cfg.TRADE_MODE, Cfg.UNDERLYING)
+        logger.info("🚀 Starting %s — mode=%s underlying=%s", VERSION, Cfg.TRADE_MODE, Cfg.UNDERLYING)
 
         if Cfg.API_KEY:
             ok = await self.angel.async_login()
