@@ -988,6 +988,7 @@ class StateStore:
             }
             try:
                 # 🛡️ Atomic Save (Prevents corruption on crash)
+                self._path.parent.mkdir(parents=True, exist_ok=True)
                 tmp_file = self._path.with_suffix(".tmp")
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, lambda: tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8"))
@@ -1064,22 +1065,26 @@ class AngelClient:
                     logger.error("❌ Login failed after %d attempts: %s", max_retries, exc)
         return False
 
+    async def async_login(self, max_retries: int = 3) -> bool:
+        try:
+            await asyncio.wait_for(self._session_lock.acquire(), timeout=30.0)
+            try:
+                if time.time() - self._login_time < 300:
+                    return True
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, self.login, max_retries)
+            finally:
+                self._session_lock.release()
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for Angel One session lock.")
+            return False
+
     async def ensure_session(self) -> None:
         # ✅ Fix #1: Only one coroutine can refresh the session at a time
         # 19800s = 5.5h — consistent with health_check threshold
         if time.time() - self._login_time > 19800:
-            try:
-                await asyncio.wait_for(self._session_lock.acquire(), timeout=10.0)
-                try:
-                    # Double-check after acquiring lock (another coroutine may have refreshed)
-                    if time.time() - self._login_time > 19800:
-                        logger.info("🔄 Session expired — re-logging in...")
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, self.login)
-                finally:
-                    self._session_lock.release()
-            except asyncio.TimeoutError:
-                logger.error("Timeout waiting for Angel One session lock. Possible deadlock prevented.")
+            logger.info("🔄 Session expired — re-logging in...")
+            await self.async_login()
 
     async def place_order(self, params: Dict[str, Any]) -> str:
         await self.ensure_session()
@@ -1471,7 +1476,7 @@ class TradingEngine:
         logger.info("🚀 Starting — mode=%s underlying=%s", Cfg.TRADE_MODE, Cfg.UNDERLYING)
 
         if Cfg.API_KEY:
-            ok = await self._loop.run_in_executor(None, self.angel.login)
+            ok = await self.angel.async_login()
             if not ok and Cfg.TRADE_MODE == "live":
                 raise RuntimeError("Angel One login failed")
             if ok:
@@ -1686,7 +1691,7 @@ class TradingEngine:
                 )
                 await asyncio.sleep(delay)
                 if Cfg.API_KEY and self._loop:
-                    await self._loop.run_in_executor(None, self.angel.login)
+                    await self.angel.async_login()
 
     async def _connect_ws(self) -> None:
         if not self.angel.auth_token:
@@ -2262,9 +2267,7 @@ class TradingEngine:
             if session_age_h > 5.5 or not self.angel.auth_token:
                 # Re-login
                 try:
-                    ok = await asyncio.get_running_loop().run_in_executor(
-                        None, self.angel.login
-                    )
+                    ok = await self.angel.async_login()
                     if ok:
                         results["AngelOne"] = ("🔧", f"Session refreshed (was {session_age_h:.1f}h old)", True)
                     else:
