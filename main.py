@@ -83,6 +83,7 @@ class IndicatorEngine:
         self._cur_close = 0.0
         self._cur_volume = 0
         self._cur_candle_start = 0.0
+        self._last_tick_sec = 0.0
 
         # VWAP
         self._vwap_cum_pv   = 0.0
@@ -261,6 +262,7 @@ class IndicatorEngine:
 
     def on_tick(self, tick: Tick) -> Optional[Candle]:
         ts_sec = tick.timestamp_ms / 1000.0
+        self._last_tick_sec = ts_sec
         price  = tick.ltp
         vol    = max(0, tick.volume)
         self._maybe_reset_vwap(ts_sec)
@@ -314,8 +316,9 @@ class IndicatorEngine:
         
         # Bug 7: Project current volume for incomplete candles
         if self._cur_candle_start > 0:
-            elapsed = time.time() - self._cur_candle_start
-            pct = min(elapsed / self.CANDLE_SECONDS, 1.0)
+            now_ts = getattr(self, '_last_tick_sec', 0.0) if getattr(self, '_last_tick_sec', 0.0) > 0 else time.time()
+            elapsed = now_ts - self._cur_candle_start
+            pct = max(0.0, min(elapsed / self.CANDLE_SECONDS, 1.0))
             projected = self._cur_volume / max(pct, 0.1)  # Min 10% to avoid /0 error
         else:
             projected = self._cur_volume
@@ -1039,12 +1042,13 @@ class AngelClient:
                 totp           = pyotp.TOTP(Cfg.TOTP_SECRET).now()
                 self._client   = SmartConnect(api_key=Cfg.API_KEY)
                 session        = self._client.generateSession(Cfg.CLIENT_ID, Cfg.PASSWORD, totp)
-                if not (session and session.get("status")):
+                if not (session and isinstance(session, dict) and session.get("status")):
+                    err_msg = session.get('message', session) if isinstance(session, dict) else str(session)
                     if attempt < max_retries:
-                        logger.warning("⚠️ Login attempt %d failed: %s. Retrying in 10s...", attempt, session.get('message', session))
+                        logger.warning("⚠️ Login attempt %d failed: %s. Retrying in 10s...", attempt, err_msg)
                         time.sleep(10)  # Safe here because it's run inside a ThreadPoolExecutor
                         continue
-                    raise RuntimeError(f"Session failed: {session}")
+                    raise RuntimeError(f"Session failed: {err_msg}")
                 self.auth_token  = session["data"]["jwtToken"]
                 self.feed_token  = self._client.getfeedToken()
                 self._login_time = time.time()
@@ -1803,12 +1807,13 @@ class TradingEngine:
         
         await self.state.check_day_rollover()
 
-        # Skip market hours check in demo mode (simulation bypasses via _process_tick_demo)
-        if not self._demo_mode and (not _is_trading_hours() or self.state.day_blocked()):
+        t_now = _hhmm()
+        
+        # 🟢 DATA GATHERING WINDOW: Process ticks only during NSE normal hours
+        if not self._demo_mode and (t_now < 915 or t_now > 1530):
             return
-        # Bug Fix: removed duplicate day_blocked() check (was dead code after the line above)
 
-        # Continuous Background Execution (Crucial for Smart Exits)
+        # Continuous Background Execution (Crucial for VWAP, EMAs, Smart Exits)
         if token not in self.indicators:
             self.indicators[token] = IndicatorEngine()
         ind = self.indicators[token]
@@ -1818,7 +1823,11 @@ class TradingEngine:
             await self._check_smart_exit(ltp, ind)
             return
             
+        # 🔴 NEW TRADE WINDOW: Check stricter trading hours explicitly before firing new orders
         if not self._trade_armed:
+            return
+
+        if not self._demo_mode and (not _is_trading_hours() or self.state.day_blocked()):
             return
 
         result = self.strategy.evaluate(ltp, ind)
@@ -2010,11 +2019,10 @@ class TradingEngine:
 
     async def _exit_trade(self, ltp: float, reason: str = "SIGNAL_EXIT") -> None:
         if self._exit_lock.locked():
-            logger.debug("Exit already in progress (%s) — skipping duplicate", reason)
-            return
-        if not self.state.active_trade:
-            return
+            logger.debug("Exit already in progress (%s) — waiting out lock", reason)
         async with self._exit_lock:
+            if not self.state.active_trade:
+                return
             try:
                 trade = self.state.active_trade
                 rem_qty = trade.lot_size
